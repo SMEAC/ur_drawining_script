@@ -35,8 +35,13 @@ Tunable properties are module-level constants at the top of `image_to_urscript.p
 - **edges**: blur → Canny → `trace_strokes`. This is a custom 8-neighbour walker over a 1-px line map, which avoids the doubled outlines `cv2.findContours` gives.
 - **comic**: `equalizeHist` → two smoothing paths. Heavy bilateral smoothing feeds k-means posterising into `TONE_LEVELS` (index 0 = darkest). Light smoothing feeds the XDoG edge term (DoG threshold) for ink → `thin` → `trace_strokes`. Shading comes from `fill_strokes`, which works per connected region of (tone ≤ max_tone, pen) for each `HATCH_LAYERS` entry `(angle, spacing_mm, max_tone)`:
   - `scanlines` cuts the region into runs along the fill direction.
-  - `FILL_STYLE="zigzag"` (default): `zigzag_strokes` chains the runs of consecutive scanlines into one back-and-forth polyline. Run ends are inset by spacing/2 so the quadratic-Bézier turns can bulge back out to the edge. A chain breaks when the turn or connecting move would leave the region (checked against the mask, dilated by 1 px).
-  - `FILL_STYLE="lines"`: one 2-point stroke per run.
+  - `chain_runs` groups runs of consecutive scanlines that overlap along the fill direction into chains, one strip of the region each.
+  - `chained_strokes` turns each chain into pen paths, depending on `FILL_STYLE`:
+    - `"zigzag"` (default): V-shaped diagonals through alternating run ends (start of even runs, end of odd runs).
+    - `"z-lines"`: each run drawn forwards, followed by a diagonal back to the next run's start.
+    - `"serpentine"`: alternating runs joined by turns. Run ends are inset by spacing/2 so the quadratic-Bézier turns can bulge back out to the edge.
+    - In all three, a path is split wherever a connecting move would leave the region (checked against the mask, dilated by 1 px).
+  - `FILL_STYLE="lines"`: one 2-point stroke per run. The GUI's choices come from `FILL_STYLES`.
   - `FILL_DIRECTION="shape"`: `region_axis` uses image moments, and only regions with elongation ≥ `FILL_SHAPE_MIN_ELONGATION` follow their own axis. Layer angles then become relative to the first layer.
   - Jitter uses stdlib `random.Random(FILL_SEED)`, not numpy.random, whose `_pcg64` DLL is blocked by Application Control here.
 - **Shared back end**: scale to mm with image Y flipped to feature +Y → `approxPolyDP` simplify → drop short strokes → greedy nearest-neighbour ordering (strokes may be reversed) → URScript.

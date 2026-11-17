@@ -91,9 +91,9 @@ TABS = {
         ("INK_MIN_AREA_PX", "Ink min speck (px)", "int", 0, 500, 5),
     ],
     "Fill": [
-        ("FILL_STYLE", "Fill style", "choice", ["zigzag", "lines"]),
+        ("FILL_STYLE", "Fill style", "choice", core.FILL_STYLES),
         ("FILL_DIRECTION", "Direction", "choice", ["shape", "fixed"]),
-        ("FILL_ROUND_TURNS", "Rounded turns (zigzag)", "bool"),
+        ("FILL_ROUND_TURNS", "Rounded turns (serpentine)", "bool"),
         ("FILL_JITTER_MM", "Hand-drawn jitter (mm)", "float", 0, 3, 0.1),
         ("FILL_SHAPE_MIN_ELONGATION", "Follow shape if elongated ≥", "float", 1, 10, 0.25),
         ("FILL_SEED", "Jitter seed", "int", 0, 9999, 1),

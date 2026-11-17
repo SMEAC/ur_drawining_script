@@ -138,16 +138,19 @@ HATCH_LAYERS = [
 HATCH_MIN_REGION_PX = 40  # ignore tone regions smaller than this
 
 # How shading regions are filled:
-#   "zigzag" – one continuous back-and-forth stroke per region, like colouring in by hand
-#   "lines"  – separate straight hatch lines (pen lifts after every line)
+#   "zigzag"     – V V V: continuous diagonals from edge to opposite edge, like scribbling
+#   "z-lines"    – Z Z Z: lines all drawn the same way, each followed by a diagonal back
+#   "serpentine" – back-and-forth lines joined by short (optionally rounded) turns
+#   "lines"      – separate straight hatch lines (pen lifts after every line)
 FILL_STYLE = "zigzag"
+FILL_STYLES = ["zigzag", "z-lines", "serpentine", "lines"]
 # "shape" – fill along each region's long axis (layer angles become relative:
 #           the first layer follows the shape, the others keep their angle difference)
 # "fixed" – use the layer angles as given
 FILL_DIRECTION = "shape"
 FILL_SHAPE_MIN_ELONGATION = 2.0  # ("shape") only regions at least this elongated follow their
                                  # own axis; rounder regions keep the layer angle
-FILL_ROUND_TURNS = True  # (zigzag) loop-shaped turns instead of sharp V-turns
+FILL_ROUND_TURNS = True  # (serpentine) loop-shaped turns instead of sharp corners
 FILL_JITTER_MM = 0.3      # random variation of spacing and line ends; 0 = machine-perfect
 FILL_SEED = 0             # jitter is repeatable for the same seed
 
@@ -383,10 +386,46 @@ def scanlines(mask: np.ndarray, angle_deg: float, spacing_px: float,
     return lines, d
 
 
-def zigzag_strokes(lines, d: np.ndarray, mask: np.ndarray, spacing_px: float) -> list[np.ndarray]:
-    """Chain the runs of consecutive scanlines into continuous back-and-forth strokes.
-    A chain breaks when the next line has no run near the current end, or when the
-    connecting turn would leave the region (that would draw over white areas)."""
+def chain_runs(lines, d: np.ndarray) -> list[list]:
+    """Group runs of consecutive scanlines that overlap along the fill direction into chains:
+    each chain is a strip of the region that can be filled in one go."""
+    used = [[False] * len(runs) for runs in lines]
+    chains = []
+    for k, runs in enumerate(lines):
+        for i in range(len(runs)):
+            if used[k][i]:
+                continue
+            used[k][i] = True
+            chain, cur, kk = [runs[i]], runs[i], k
+            while kk + 1 < len(lines):
+                a0, a1 = cur[0] @ d, cur[1] @ d
+                best = None
+                for j, (q0, q1) in enumerate(lines[kk + 1]):
+                    if used[kk + 1][j]:
+                        continue
+                    overlap = min(a1, q1 @ d) - max(a0, q0 @ d)
+                    if overlap > 0 and (best is None or overlap > best[0]):
+                        best = (overlap, j)
+                if best is None:
+                    break
+                used[kk + 1][best[1]] = True
+                cur = lines[kk + 1][best[1]]
+                chain.append(cur)
+                kk += 1
+            chains.append(chain)
+    return chains
+
+
+def chained_strokes(lines, d: np.ndarray, mask: np.ndarray, spacing_px: float,
+                    style: str) -> list[np.ndarray]:
+    """Turn chains of scanline runs into continuous pen paths. Every connecting move is
+    checked against the region; where one would leave it (and draw over white areas),
+    the path is split instead.
+
+      zigzag      V V V: only diagonals, edge to opposite edge, one line further each time
+      z-lines     Z Z Z: each line drawn in the same direction, diagonal back to the next start
+      serpentine  back-and-forth lines joined by short (optionally rounded) turns
+    """
     h, w = mask.shape
     ok_mask = cv2.dilate(mask.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0  # rounding slack
 
@@ -395,65 +434,68 @@ def zigzag_strokes(lines, d: np.ndarray, mask: np.ndarray, spacing_px: float) ->
         yi = np.clip(np.round(pts[:, 1]).astype(int), 0, h - 1)
         return bool(ok_mask[yi, xi].all())
 
-    # with rounded turns, pull run ends inwards so the loop can bulge back out to the edge
-    inset_px = spacing_px / 2 if FILL_ROUND_TURNS else 0.0
-    insets = []
-    for runs in lines:
-        row = []
-        for run in runs:
-            k = min(inset_px, np.linalg.norm(run[1] - run[0]) / 3)
-            run[0], run[1] = run[0] + d * k, run[1] - d * k
-            row.append(k)
-        insets.append(row)
-    # longer jumps are fine as long as the connecting move stays inside the region (checked
-    # in turn()); it then only re-colours area that is being coloured anyway
-    max_jump = 6 * spacing_px + 2 * inset_px
+    def segment_ok(p, q):
+        n = max(2, int(np.linalg.norm(q - p) / 0.5))
+        return inside(p + (q - p) * np.linspace(0, 1, n)[:, None])
 
     def turn(p, q, along, bulge):
-        """Points strictly between p and q (rounded loop if possible), or None if impossible."""
-        if bulge > 0.3:
+        """Serpentine turn: points strictly between p and q, or None if impossible."""
+        if FILL_ROUND_TURNS and bulge > 0.3:
             c = (p + q) / 2 + along * 2 * bulge      # quadratic bezier peak reaches `bulge`
             s = np.linspace(0, 1, 24)[:, None]
             curve = (1 - s) ** 2 * p + 2 * (1 - s) * s * c + s ** 2 * q
             if inside(curve):
                 return curve[3:-3:4]
-        n = max(2, int(np.linalg.norm(q - p) / 0.5))
-        if inside(p + (q - p) * np.linspace(0, 1, n)[:, None]):
-            return np.empty((0, 2))
-        return None
+        return np.empty((0, 2)) if segment_ok(p, q) else None
 
-    used = [[False] * len(runs) for runs in lines]
     strokes = []
-    for k, runs in enumerate(lines):
-        for i in range(len(runs)):
-            if used[k][i]:
+    for chain in chain_runs(lines, d):
+        if style == "zigzag":
+            if len(chain) == 1:           # a lone line: just draw it
+                strokes.append(np.array(chain[0]))
                 continue
-            used[k][i] = True
-            pts = [runs[i][0], runs[i][1]]
-            forward, cur_inset, kk = True, insets[k][i], k
-            while kk + 1 < len(lines):
-                end = pts[-1]
-                best = None
-                for j, (q0, q1) in enumerate(lines[kk + 1]):
-                    if used[kk + 1][j]:
-                        continue
-                    near = q1 if forward else q0   # next run is drawn in the opposite direction
-                    dist = np.linalg.norm(near - end)
-                    if dist <= max_jump and (best is None or dist < best[0]):
-                        best = (dist, j)
-                if best is None:
-                    break
-                j = best[1]
-                q0, q1 = lines[kk + 1][j]
+            # vertices alternate between the two edges: start of even lines, end of odd lines
+            verts = [run[0] if i % 2 == 0 else run[1] for i, run in enumerate(chain)]
+            path = [verts[0]]
+            for v in verts[1:]:
+                if not segment_ok(path[-1], v):
+                    if len(path) > 1:
+                        strokes.append(np.array(path))
+                    path = []
+                path.append(v)
+            if len(path) > 1:
+                strokes.append(np.array(path))
+
+        elif style == "z-lines":
+            path = [chain[0][0], chain[0][1]]
+            for run in chain[1:]:
+                if not segment_ok(path[-1], run[0]):   # the diagonal back across
+                    strokes.append(np.array(path))
+                    path = []
+                path += [run[0], run[1]]
+            strokes.append(np.array(path))
+
+        else:  # serpentine
+            # with rounded turns, pull run ends inwards so the loop can bulge back to the edge
+            inset_px = spacing_px / 2 if FILL_ROUND_TURNS else 0.0
+            runs, insets = [], []
+            for p0, p1 in chain:
+                k = min(inset_px, np.linalg.norm(p1 - p0) / 3)
+                runs.append((p0 + d * k, p1 - d * k))
+                insets.append(k)
+            path = [runs[0][0], runs[0][1]]
+            forward = True
+            for i in range(1, len(runs)):
+                q0, q1 = runs[i]
                 start, finish = (q1, q0) if forward else (q0, q1)
-                along = d if forward else -d
-                conn = turn(end, start, along, min(cur_inset, insets[kk + 1][j]))
+                conn = turn(path[-1], start, d if forward else -d, min(insets[i - 1], insets[i]))
                 if conn is None:
-                    break
-                used[kk + 1][j] = True
-                pts += list(conn) + [start, finish]
-                forward, cur_inset, kk = not forward, insets[kk + 1][j], kk + 1
-            strokes.append(np.array(pts))
+                    strokes.append(np.array(path))
+                    path = [start, finish]
+                else:
+                    path += list(conn) + [start, finish]
+                forward = not forward
+            strokes.append(np.array(path))
     return strokes
 
 
@@ -495,10 +537,10 @@ def fill_strokes(tones: np.ndarray, px_per_mm: float,
                     if axis is not None:
                         angle = axis + (angle_deg - base_angle)
                 lines, d = scanlines(sub, angle, spacing_px, rng, jitter_px)
-                if FILL_STYLE == "zigzag":
-                    polys = zigzag_strokes(lines, d, sub, spacing_px)
-                else:
+                if FILL_STYLE == "lines":
                     polys = [np.array(run) for runs in lines for run in runs]
+                else:
+                    polys = chained_strokes(lines, d, sub, spacing_px, FILL_STYLE)
                 for p in polys:  # crop (x, y) -> image (row, col)
                     strokes.append((int(pen), np.column_stack([p[:, 1] + y0, p[:, 0] + x0])
                                     .astype(np.float32)))
