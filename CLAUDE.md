@@ -24,7 +24,7 @@ uv run src/image_to_urscript.py images/monalisa.png --style comic --colours blac
 
 GUI: `uv run src/robot_painter_gui.py`. It offers drag & drop (tkinterdnd2), live settings, webcam mode and a save button.
 
-Windows Application Control on this machine blocks the `opencv-contrib-python` DLL. Stick to `opencv-python-headless` and implement anything from `cv2.ximgproc` and similar modules in numpy (e.g. `thin()` is a hand-written Zhang-Suen thinning).
+Windows Application Control on this machine blocks the `opencv-contrib-python` DLL and numpy's `numpy.random` extension (`_pcg64`). Stick to `opencv-python-headless` and implement anything from `cv2.ximgproc` and similar modules in numpy (e.g. `thin()` is a hand-written Zhang-Suen thinning).
 
 Always check `<name>_preview.png` after a change. It is the only way to verify the output locally. The `.script` files run on the UR controller (Script node in PolyScope); no simulator is set up here.
 
@@ -33,7 +33,12 @@ Always check `<name>_preview.png` after a change. It is the only way to verify t
 Tunable properties are module-level constants at the top of `image_to_urscript.py`, grouped by style. Both styles produce a list of pixel-space polylines `(row, col)` that feed a shared back end.
 
 - **edges**: blur → Canny → `trace_strokes`. This is a custom 8-neighbour walker over a 1-px line map, which avoids the doubled outlines `cv2.findContours` gives.
-- **comic**: `equalizeHist` → two smoothing paths. Heavy bilateral smoothing feeds k-means posterising into `TONE_LEVELS` (index 0 = darkest). Light smoothing feeds the XDoG edge term (DoG threshold) for ink → `thin` → `trace_strokes`. Shading comes from `hatch_strokes`: each `HATCH_LAYERS` entry `(angle, spacing_mm, max_tone)` draws parallel 2-point strokes clipped to regions with tone ≤ max_tone, so darker tones stack layers into cross-hatching.
+- **comic**: `equalizeHist` → two smoothing paths. Heavy bilateral smoothing feeds k-means posterising into `TONE_LEVELS` (index 0 = darkest). Light smoothing feeds the XDoG edge term (DoG threshold) for ink → `thin` → `trace_strokes`. Shading comes from `fill_strokes`, which works per connected region of (tone ≤ max_tone, pen) for each `HATCH_LAYERS` entry `(angle, spacing_mm, max_tone)`:
+  - `scanlines` cuts the region into runs along the fill direction.
+  - `FILL_STYLE="zigzag"` (default): `zigzag_strokes` chains the runs of consecutive scanlines into one back-and-forth polyline. Run ends are inset by spacing/2 so the quadratic-Bézier turns can bulge back out to the edge. A chain breaks when the turn or connecting move would leave the region (checked against the mask, dilated by 1 px).
+  - `FILL_STYLE="lines"`: one 2-point stroke per run.
+  - `FILL_DIRECTION="shape"`: `region_axis` uses image moments, and only regions with elongation ≥ `FILL_SHAPE_MIN_ELONGATION` follow their own axis. Layer angles then become relative to the first layer.
+  - Jitter uses stdlib `random.Random(FILL_SEED)`, not numpy.random, whose `_pcg64` DLL is blocked by Application Control here.
 - **Shared back end**: scale to mm with image Y flipped to feature +Y → `approxPolyDP` simplify → drop short strokes → greedy nearest-neighbour ordering (strokes may be reversed) → URScript.
 
 Core API, used by both the CLI and the GUI: `process(bgr, style) -> Result` → `urscript_text(result, name, colour)` / `render_preview(result, px_per_mm)`. These functions work in memory. Only `main()` writes files.

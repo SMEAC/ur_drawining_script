@@ -9,7 +9,7 @@ draw it relative to the PolyScope feature "Feature1".
 Styles:
     edges  Canny edge outlines only (default)
     comic  Comic look: smoothed + posterised image, XDoG ink lines,
-           and shading drawn as hatching / cross-hatching
+           and shading (zig-zag colouring in, or hatch lines)
 
 Colours:
     The robot can draw with up to 4 pens (PEN_COLOURS). Each stroke gets the pen
@@ -31,6 +31,7 @@ Outputs:
 """
 
 import argparse
+import random
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -105,7 +106,7 @@ CANNY_HIGH = 150
 
 # --- "comic" style ---
 COMIC_INK = True    # draw ink lines
-COMIC_HATCH = True  # draw hatching
+COMIC_HATCH = True  # draw shading fill
 
 # 0. Contrast: histogram equalisation spreads dark images (like the Mona Lisa)
 #    across all tones so hatching doesn't cover everything
@@ -127,14 +128,28 @@ INK_K = 1.6             # ratio between the two Gaussians
 INK_THRESHOLD = 0.010   # lower = more lines
 INK_MIN_AREA_PX = 30    # drop ink specks smaller than this before thinning
 
-# 4. Hatching: (angle in degrees, line spacing in mm, darkest..max_tone)
-#    Each layer hatches every region whose tone index (0 = darkest) is <= max_tone,
-#    so dark regions accumulate layers -> cross-hatching.
+# 4. Shading fill: (angle in degrees, line spacing in mm, darkest..max_tone)
+#    Each layer fills every region whose tone index (0 = darkest) is <= max_tone,
+#    so dark regions get several passes -> cross-hatching.
 HATCH_LAYERS = [
     (45, 3.0, 1),
     (-45, 3.0, 0),
 ]
 HATCH_MIN_REGION_PX = 40  # ignore tone regions smaller than this
+
+# How shading regions are filled:
+#   "zigzag" – one continuous back-and-forth stroke per region, like colouring in by hand
+#   "lines"  – separate straight hatch lines (pen lifts after every line)
+FILL_STYLE = "zigzag"
+# "shape" – fill along each region's long axis (layer angles become relative:
+#           the first layer follows the shape, the others keep their angle difference)
+# "fixed" – use the layer angles as given
+FILL_DIRECTION = "shape"
+FILL_SHAPE_MIN_ELONGATION = 2.0  # ("shape") only regions at least this elongated follow their
+                                 # own axis; rounder regions keep the layer angle
+FILL_ROUND_TURNS = True  # (zigzag) loop-shaped turns instead of sharp V-turns
+FILL_JITTER_MM = 0.3      # random variation of spacing and line ends; 0 = machine-perfect
+FILL_SEED = 0             # jitter is repeatable for the same seed
 
 # ---------------------------------------------------------------------------
 
@@ -335,44 +350,158 @@ def thin(mask: np.ndarray) -> np.ndarray:
             return img[1:-1, 1:-1].astype(bool)
 
 
-def hatch_strokes(tones: np.ndarray, px_per_mm: float,
-                  labels: np.ndarray) -> list[tuple[int, np.ndarray]]:
-    """Hatch lines clipped to tone regions; each line is also cut where the pen colour changes."""
-    h, w = tones.shape
+def scanlines(mask: np.ndarray, angle_deg: float, spacing_px: float,
+              rng: random.Random, jitter_px: float):
+    """Cut the mask with parallel lines. Returns (lines, d): lines[k] is the list of runs on
+    scanline k, each run [start_xy, end_xy] pointing along the unit direction d."""
+    h, w = mask.shape
+    a = np.deg2rad(angle_deg)
+    d = np.array([np.cos(a), np.sin(a)])      # along the lines (x, y)
+    nrm = np.array([-d[1], d[0]])              # across the lines
+    corners = np.array([[0, 0], [w, 0], [0, h], [w, h]], float)
+    t = np.arange((corners @ d).min(), (corners @ d).max(), 0.5)
+    lines = []
+    for o in np.arange((corners @ nrm).min() + spacing_px / 2, (corners @ nrm).max(), spacing_px):
+        if jitter_px:
+            o += rng.uniform(-jitter_px, jitter_px)
+        x, y = nrm[0] * o + d[0] * t, nrm[1] * o + d[1] * t
+        xi, yi = np.round(x).astype(int), np.round(y).astype(int)
+        inside = (xi >= 0) & (xi < w) & (yi >= 0) & (yi < h)
+        on = np.zeros(len(t), bool)
+        on[inside] = mask[yi[inside], xi[inside]]
+        edges = np.diff(np.r_[0, on.astype(np.int8), 0])
+        runs = []
+        for s, e in zip(np.nonzero(edges == 1)[0], np.nonzero(edges == -1)[0] - 1):
+            if e <= s:
+                continue
+            p0, p1 = np.array([x[s], y[s]]), np.array([x[e], y[e]])
+            if jitter_px:  # ragged ends, but never past the region edge
+                limit = min(jitter_px, np.linalg.norm(p1 - p0) / 4)
+                p0, p1 = p0 + d * rng.uniform(0, limit), p1 - d * rng.uniform(0, limit)
+            runs.append([p0, p1])
+        lines.append(runs)
+    return lines, d
+
+
+def zigzag_strokes(lines, d: np.ndarray, mask: np.ndarray, spacing_px: float) -> list[np.ndarray]:
+    """Chain the runs of consecutive scanlines into continuous back-and-forth strokes.
+    A chain breaks when the next line has no run near the current end, or when the
+    connecting turn would leave the region (that would draw over white areas)."""
+    h, w = mask.shape
+    ok_mask = cv2.dilate(mask.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0  # rounding slack
+
+    def inside(pts):
+        xi = np.clip(np.round(pts[:, 0]).astype(int), 0, w - 1)
+        yi = np.clip(np.round(pts[:, 1]).astype(int), 0, h - 1)
+        return bool(ok_mask[yi, xi].all())
+
+    # with rounded turns, pull run ends inwards so the loop can bulge back out to the edge
+    inset_px = spacing_px / 2 if FILL_ROUND_TURNS else 0.0
+    insets = []
+    for runs in lines:
+        row = []
+        for run in runs:
+            k = min(inset_px, np.linalg.norm(run[1] - run[0]) / 3)
+            run[0], run[1] = run[0] + d * k, run[1] - d * k
+            row.append(k)
+        insets.append(row)
+    # longer jumps are fine as long as the connecting move stays inside the region (checked
+    # in turn()); it then only re-colours area that is being coloured anyway
+    max_jump = 6 * spacing_px + 2 * inset_px
+
+    def turn(p, q, along, bulge):
+        """Points strictly between p and q (rounded loop if possible), or None if impossible."""
+        if bulge > 0.3:
+            c = (p + q) / 2 + along * 2 * bulge      # quadratic bezier peak reaches `bulge`
+            s = np.linspace(0, 1, 24)[:, None]
+            curve = (1 - s) ** 2 * p + 2 * (1 - s) * s * c + s ** 2 * q
+            if inside(curve):
+                return curve[3:-3:4]
+        n = max(2, int(np.linalg.norm(q - p) / 0.5))
+        if inside(p + (q - p) * np.linspace(0, 1, n)[:, None]):
+            return np.empty((0, 2))
+        return None
+
+    used = [[False] * len(runs) for runs in lines]
+    strokes = []
+    for k, runs in enumerate(lines):
+        for i in range(len(runs)):
+            if used[k][i]:
+                continue
+            used[k][i] = True
+            pts = [runs[i][0], runs[i][1]]
+            forward, cur_inset, kk = True, insets[k][i], k
+            while kk + 1 < len(lines):
+                end = pts[-1]
+                best = None
+                for j, (q0, q1) in enumerate(lines[kk + 1]):
+                    if used[kk + 1][j]:
+                        continue
+                    near = q1 if forward else q0   # next run is drawn in the opposite direction
+                    dist = np.linalg.norm(near - end)
+                    if dist <= max_jump and (best is None or dist < best[0]):
+                        best = (dist, j)
+                if best is None:
+                    break
+                j = best[1]
+                q0, q1 = lines[kk + 1][j]
+                start, finish = (q1, q0) if forward else (q0, q1)
+                along = d if forward else -d
+                conn = turn(end, start, along, min(cur_inset, insets[kk + 1][j]))
+                if conn is None:
+                    break
+                used[kk + 1][j] = True
+                pts += list(conn) + [start, finish]
+                forward, cur_inset, kk = not forward, insets[kk + 1][j], kk + 1
+            strokes.append(np.array(pts))
+    return strokes
+
+
+def region_axis(mask: np.ndarray) -> float | None:
+    """Long-axis angle (degrees, image coords) of a region from its second moments, or None
+    if the region is too round for a meaningful direction (then the layer angle is kept)."""
+    m = cv2.moments(mask.astype(np.uint8), binaryImage=True)
+    mu20, mu02, mu11 = m["mu20"], m["mu02"], m["mu11"]
+    spread = np.sqrt(4 * mu11 ** 2 + (mu20 - mu02) ** 2)
+    major, minor = (mu20 + mu02 + spread) / 2, (mu20 + mu02 - spread) / 2
+    if minor <= 0 or np.sqrt(major / minor) < FILL_SHAPE_MIN_ELONGATION:
+        return None
+    return float(np.degrees(0.5 * np.arctan2(2 * mu11, mu20 - mu02)))
+
+
+def fill_strokes(tones: np.ndarray, px_per_mm: float,
+                 labels: np.ndarray) -> list[tuple[int, np.ndarray]]:
+    """Shading: fill each tone region (per pen colour) with hatch lines or a zig-zag.
+    Returns (pen index, (row, col) polyline) pairs."""
+    rng = random.Random(FILL_SEED)  # stdlib: numpy.random's DLL is blocked by Application Control here
     kernel = np.ones((3, 3), np.uint8)
-    corners = np.array([[0, 0], [w, 0], [0, h], [w, h]], np.float32)  # (x, y)
+    jitter_px = max(0.0, FILL_JITTER_MM) * px_per_mm
+    base_angle = HATCH_LAYERS[0][0] if HATCH_LAYERS else 0
     strokes = []
     for angle_deg, spacing_mm, max_tone in HATCH_LAYERS:
-        mask = (tones <= max_tone).astype(np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        n, comp, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
-        keep = np.zeros(n, bool)
-        keep[1:] = stats[1:, cv2.CC_STAT_AREA] >= HATCH_MIN_REGION_PX
-        mask = keep[comp]
-
-        a = np.deg2rad(angle_deg)
-        d = np.array([np.cos(a), np.sin(a)], np.float32)   # along the hatch line
-        nrm = np.array([-d[1], d[0]], np.float32)            # across the lines
-        t_min, t_max = (corners @ d).min(), (corners @ d).max()
-        o_min, o_max = (corners @ nrm).min(), (corners @ nrm).max()
-        t = np.arange(t_min, t_max, 0.5, dtype=np.float32)
+        mask = cv2.morphologyEx((tones <= max_tone).astype(np.uint8), cv2.MORPH_OPEN, kernel) > 0
         spacing_px = max(spacing_mm, 0.3) * px_per_mm
-
-        for o in np.arange(o_min + spacing_px / 2, o_max, spacing_px):
-            x = nrm[0] * o + d[0] * t
-            y = nrm[1] * o + d[1] * t
-            xi, yi = np.round(x).astype(int), np.round(y).astype(int)
-            inside = (xi >= 0) & (xi < w) & (yi >= 0) & (yi < h)
-            key = np.full(len(t), -1, np.int32)   # -1 = no hatching, else pen index
-            on = np.zeros(len(t), bool)
-            on[inside] = mask[yi[inside], xi[inside]]
-            key[on] = labels[yi[on], xi[on]]
-            # split into runs of constant key
-            change = np.nonzero(np.diff(key))[0] + 1
-            for s, e in zip(np.r_[0, change], np.r_[change, len(t)]):
-                if key[s] >= 0 and e - 1 > s:
-                    strokes.append((int(key[s]),
-                                    np.array([[y[s], x[s]], [y[e - 1], x[e - 1]]], np.float32)))
+        for pen in np.unique(labels[mask]):
+            region = (mask & (labels == pen)).astype(np.uint8)
+            n, comp, stats, _ = cv2.connectedComponentsWithStats(region, connectivity=8)
+            for i in range(1, n):
+                if stats[i, cv2.CC_STAT_AREA] < HATCH_MIN_REGION_PX:
+                    continue
+                x0, y0, w, h = stats[i, :4]
+                sub = comp[y0:y0 + h, x0:x0 + w] == i
+                angle = angle_deg
+                if FILL_DIRECTION == "shape":
+                    axis = region_axis(sub)
+                    if axis is not None:
+                        angle = axis + (angle_deg - base_angle)
+                lines, d = scanlines(sub, angle, spacing_px, rng, jitter_px)
+                if FILL_STYLE == "zigzag":
+                    polys = zigzag_strokes(lines, d, sub, spacing_px)
+                else:
+                    polys = [np.array(run) for runs in lines for run in runs]
+                for p in polys:  # crop (x, y) -> image (row, col)
+                    strokes.append((int(pen), np.column_stack([p[:, 1] + y0, p[:, 0] + x0])
+                                    .astype(np.float32)))
     return strokes
 
 
@@ -389,7 +518,7 @@ def comic_strokes(gray: np.ndarray, labels: np.ndarray):
         for s in trace_strokes(thin(ink)):
             strokes += split_by_colour(s, labels)
     if COMIC_HATCH:
-        strokes += hatch_strokes(tones, 1.0 / mm_per_pixel(gray.shape), labels)
+        strokes += fill_strokes(tones, 1.0 / mm_per_pixel(gray.shape), labels)
     return strokes, comic
 
 
@@ -637,7 +766,7 @@ def main():
     parser.add_argument("-o", "--output", type=Path, help="output .script (default: <image>.script)")
     parser.add_argument("--width", type=float, help=f"drawing width in mm (default {IMAGE_WIDTH_MM})")
     parser.add_argument("--style", choices=["edges", "comic"], default="edges",
-                        help="edges = outlines only, comic = ink lines + hatching (default edges)")
+                        help="edges = outlines only, comic = ink lines + shading (default edges)")
     parser.add_argument("--colours", "--colors", dest="colours",
                         help=f"comma-separated pens to use, from: {','.join(PEN_COLOURS)}. "
                              "Writes one <name>_<colour>.script per pen.")

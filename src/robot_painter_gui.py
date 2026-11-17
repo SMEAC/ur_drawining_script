@@ -80,7 +80,7 @@ TABS = {
     ],
     "Comic": [
         ("COMIC_INK", "Draw ink lines", "bool"),
-        ("COMIC_HATCH", "Draw hatching", "bool"),
+        ("COMIC_HATCH", "Draw shading (Fill tab)", "bool"),
         ("EQUALIZE", "Equalise contrast", "bool"),
         ("SMOOTH_ITERATIONS", "Tone smoothing passes", "int", 0, 10, 1),
         ("SMOOTH_SIGMA_COLOR", "Smoothing strength", "float", 1, 200, 5),
@@ -89,7 +89,15 @@ TABS = {
         ("INK_SIGMA", "Ink line scale (px)", "float", 0.3, 5, 0.1),
         ("INK_THRESHOLD", "Ink threshold", "float", 0.001, 0.1, 0.001),
         ("INK_MIN_AREA_PX", "Ink min speck (px)", "int", 0, 500, 5),
-        ("HATCH_MIN_REGION_PX", "Hatch min region (px)", "int", 0, 2000, 10),
+    ],
+    "Fill": [
+        ("FILL_STYLE", "Fill style", "choice", ["zigzag", "lines"]),
+        ("FILL_DIRECTION", "Direction", "choice", ["shape", "fixed"]),
+        ("FILL_ROUND_TURNS", "Rounded turns (zigzag)", "bool"),
+        ("FILL_JITTER_MM", "Hand-drawn jitter (mm)", "float", 0, 3, 0.1),
+        ("FILL_SHAPE_MIN_ELONGATION", "Follow shape if elongated ≥", "float", 1, 10, 0.25),
+        ("FILL_SEED", "Jitter seed", "int", 0, 9999, 1),
+        ("HATCH_MIN_REGION_PX", "Min region (px)", "int", 0, 2000, 10),
     ],
 }
 
@@ -287,7 +295,7 @@ class App:
         style = ttk.LabelFrame(left, text="Style", padding=6)
         style.pack(fill="x", pady=(8, 0))
         self.style = tk.StringVar(value="comic")
-        for value, text in (("edges", "Edges (outlines)"), ("comic", "Comic (ink + hatching)")):
+        for value, text in (("edges", "Edges (outlines)"), ("comic", "Comic (ink + shading)")):
             ttk.Radiobutton(style, text=text, value=value, variable=self.style,
                             command=self.request_update).pack(anchor="w")
 
@@ -309,7 +317,7 @@ class App:
                 offset = 2
             for row, spec in enumerate(specs, offset):
                 self._add_control(frame, row, *spec)
-            if tab == "Comic":
+            if tab == "Fill":
                 self._build_hatch_layers(frame, len(specs))
         self._build_ai_tab(nb)
 
@@ -422,6 +430,11 @@ class App:
         if kind == "bool":
             var = tk.BooleanVar(value=value)
             ttk.Checkbutton(parent, text=label, variable=var).grid(row=row, column=0, columnspan=2, sticky="w")
+        elif kind == "choice":  # `lo` holds the list of allowed values
+            var = tk.StringVar(value=value)
+            ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=1)
+            ttk.Combobox(parent, textvariable=var, values=lo, state="readonly",
+                         width=8).grid(row=row, column=1, sticky="e", pady=1)
         else:
             var = tk.IntVar(value=value) if kind == "int" else tk.DoubleVar(value=value)
             ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=1)
@@ -431,7 +444,7 @@ class App:
         self.vars[attr] = var
 
     def _build_hatch_layers(self, parent, row):
-        box = ttk.LabelFrame(parent, text="Hatch layers (tone 0 = darkest)", padding=4)
+        box = ttk.LabelFrame(parent, text="Fill layers (tone 0 = darkest)", padding=4)
         box.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         for c, text in enumerate(("On", "Angle °", "Spacing mm", "Max tone")):
             ttk.Label(box, text=text).grid(row=0, column=c, padx=2)

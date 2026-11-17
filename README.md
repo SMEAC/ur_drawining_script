@@ -10,7 +10,7 @@ Turn an image into a pen drawing for a **Universal Robots (UR)** arm. The tool t
 
 - **Two drawing styles**
   - `edges`: clean outlines, from Canny edge detection.
-  - `comic`: ink lines plus shading drawn as hatching and cross-hatching.
+  - `comic`: ink lines plus shading. By default the shading is a continuous zig-zag "colouring in" stroke per area; classic separate hatch lines are also available.
 - **Up to 4 pen colours** (black, green, red, blue). Each stroke gets the pen that matches the image underneath it, and one script is written per colour.
 - **Tk GUI**:
   - Drag and drop an image, and every setting updates the preview live.
@@ -64,7 +64,7 @@ uv run src/image_to_urscript.py photo.jpg -o photo.script --width 120
 | `--style` | `edges` (default) or `comic` |
 | `--colours` | Comma-separated pens. Writes one `<name>_<colour>.script` per pen that has strokes |
 
-All other settings are constants at the top of [`src/image_to_urscript.py`](src/image_to_urscript.py), and every one of them is also available in the GUI. They cover canvas size and offset, pen up/down height, tool orientation, speeds, blend radius, edge and ink thresholds, tone levels, hatch layers and colour matching.
+All other settings are constants at the top of [`src/image_to_urscript.py`](src/image_to_urscript.py), and every one of them is also available in the GUI. They cover canvas size and offset, pen up/down height, tool orientation, speeds, blend radius, edge and ink thresholds, tone levels, fill style and layers, and colour matching.
 
 ## Running on the robot
 
@@ -94,7 +94,11 @@ image ──► (optional AI restyle) ──► strokes in pixels ──► colo
   1. Equalise the contrast and flatten the image with an edge-preserving filter.
   2. Posterise into a few tones (k-means).
   3. Draw ink lines with an XDoG-style difference of Gaussians, thinned to centre lines.
-  4. Shade by hatching the tone regions: each hatch layer `(angle, spacing mm, max tone)` covers all regions at or darker than its tone, so the darkest areas get cross-hatched.
+  4. Shade the tone regions. Each fill layer `(angle, spacing mm, max tone)` covers all regions at or darker than its tone, so the darkest areas get a second pass in a crossing direction.
+     - **Zig-zag (default).** Neighbouring fill lines in a region are joined into one back-and-forth stroke with rounded turns, so the pen stays down like when colouring by hand. A chain only breaks where the turn would leave the region. On the Mona Lisa this cuts the strokes from about 700 to about 220.
+     - **Follow shape.** Elongated regions are filled along their own long axis; round ones keep the layer angle.
+     - **Jitter.** A small, repeatable random variation in spacing and line ends makes the result look less machine-made.
+     - **Lines.** Fill style `lines` gives the classic separate hatch lines.
 - **Pen colours.**
   - **Pen per pixel.** Every pixel is assigned the closest active pen. In the default *hue* mode, grey and dark areas go to black and coloured areas go to the pen with the nearest hue. *Nearest colour* mode is meant for flat graphics.
   - **Paper.** White paper takes the colour of the nearest inked area, so outlines are drawn in the object's colour.
