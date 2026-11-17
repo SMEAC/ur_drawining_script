@@ -129,3 +129,7 @@ output/                  GUI save folder (not committed)
 
 - **OpenCV build.** The code uses `opencv-python-headless`, not `opencv-contrib-python`, because the contrib DLL is blocked on machines with Windows Application Control. Line thinning (Zhang–Suen) is therefore implemented in numpy.
 - **Safety checker.** The AI worker loads model weights only as `safetensors`. Stable Diffusion's built-in safety checker is disabled to save GPU memory.
+
+## License
+
+[MIT](LICENSE). The AI models downloaded at runtime have their own licences: Stable Diffusion 1.5 is under CreativeML OpenRAIL-M, and the ControlNet is under its own licence on Hugging Face.
