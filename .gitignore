@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# GUI save folder (source, preview and scripts per save)
+output/
+
+# AI self-test output
+images/*_ai.png
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

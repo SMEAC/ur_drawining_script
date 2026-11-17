@@ -1,0 +1,47 @@
+# 10cm x 10cm square relative to feature "Feature1"
+
+# Set the reference feature
+myFeature = Feature1
+
+textmsg("Feature Pose:", myFeature)
+
+# Store the starting TCP position
+start_pos = get_actual_tcp_pose()
+# Print current start position to Log
+# useful for determining required orientation of end effector
+textmsg("Start Pos.", start_pos)
+
+start_local = pose_trans(pose_inv(myFeature), start_pos)
+textmsg("Local TCP:", start_local)
+
+
+
+# Square dimensions (100 mm)
+d = 0.100
+
+# Movement speed and acceleration
+speed = 0.05
+acc = 0.2
+
+# orientations
+a = 1.6
+b = -1.4
+c = -0.8
+
+# 1. Move 10 cm in X direction
+pose1 = pose_trans(myFeature, p[ d, 0, 0, a, b, c])
+movel(pose1, a=acc, v=speed)
+
+# 2. Move 10 cm in Y direction
+pose2 = pose_trans(myFeature, p[ d, d, 0, a, b, c])
+movel(pose2, a=acc, v=speed)
+
+# 3. Move 10 cm in negative X direction
+pose3 = pose_trans(myFeature, p[0, d, 0, a, b, c])
+movel(pose3, a=acc, v=speed)
+
+# 4. Move 10 cm in negative Y direction
+pose4 = pose_trans(myFeature, p[0, 0, 0, a, b, c])
+movel(pose4, a=acc, v=speed)
+
+# End
