@@ -10,6 +10,8 @@ Styles:
     edges  Canny edge outlines only (default)
     comic  Comic look: smoothed + posterised image, XDoG ink lines,
            and shading (zig-zag colouring in, or hatch lines)
+    lineart  The input already IS a line drawing (e.g. from the AI restyle):
+             its dark lines are traced along their centres, one pen stroke per line
 
 Colours:
     The robot can draw with up to 4 pens (PEN_COLOURS). Each stroke gets the pen
@@ -104,6 +106,19 @@ BLUR_KERNEL = 5   # Gaussian blur (odd number), removes noise / fine texture
 CANNY_LOW = 50    # Canny thresholds: raise these for fewer, stronger lines
 CANNY_HIGH = 150
 
+# --- "lineart" style (input is already a line drawing) ---
+LINEART_RESOLUTION_PX = 1200  # work resolution; higher keeps fine, close-together lines apart
+LINEART_THRESHOLD = 225       # 0-255: pixels darker than this are ink (raise for faint lines)
+LINEART_BRIDGE_PX = 0         # close breaks in faint lines up to ~2x this; 0 = off
+LINEART_MIN_AREA_PX = 15      # drop ink specks smaller than this
+LINEART_SPUR_PX = 6           # prune side branches of the centre line shorter than this
+LINEART_SMOOTH_PX = 2         # smooth the traced centre line over +-this many pixels
+LINEART_SIMPLIFY_MM = 0.1     # point reduction tolerance (finer than SIMPLIFY_TOLERANCE_MM)
+LINEART_MIN_LENGTH_MM = 0.8   # shorter strokes are dropped (lashes and teeth are short)
+LINEART_FILL_THICK = True     # fill ink wider than ~2 pen widths (pupils, bold lashes)
+                              # with nested outlines, instead of only its centre line
+LINEART_PEN_MM = 0.5          # pen line width, the spacing of those nested outlines
+
 # --- "comic" style ---
 COMIC_INK = True    # draw ink lines
 COMIC_HATCH = True  # draw shading fill
@@ -183,13 +198,15 @@ def save_image(path: Path, img: np.ndarray) -> None:
     buf.tofile(str(path))
 
 
-def prepare(img: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """BGR (or gray) image -> (gray, bgr), resized so the longest side is WORK_RESOLUTION_PX."""
+def prepare(img: np.ndarray, resolution: int | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """BGR (or gray) image -> (gray, bgr), resized so the longest side is `resolution`
+    (default WORK_RESOLUTION_PX)."""
     if img.ndim == 2:
         img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
     h, w = img.shape[:2]
-    scale = WORK_RESOLUTION_PX / max(h, w)
-    bgr = cv2.resize(img, (round(w * scale), round(h * scale)), interpolation=cv2.INTER_AREA)
+    scale = (resolution or WORK_RESOLUTION_PX) / max(h, w)
+    interp = cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC
+    bgr = cv2.resize(img, (round(w * scale), round(h * scale)), interpolation=interp)
     return cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY), bgr
 
 
@@ -291,6 +308,241 @@ def edge_strokes(gray: np.ndarray) -> list[np.ndarray]:
     blurred = cv2.GaussianBlur(gray, (k, k), 0)
     edges = cv2.Canny(blurred, CANNY_LOW, CANNY_HIGH) > 0
     return trace_strokes(edges)
+
+
+# --------------------------- "lineart" style -------------------------------
+
+def neighbour_count(mask: np.ndarray) -> np.ndarray:
+    """Number of 8-connected set neighbours of every pixel."""
+    k = np.ones((3, 3), np.float32)
+    k[1, 1] = 0
+    return cv2.filter2D(mask.astype(np.float32), -1, k, borderType=cv2.BORDER_CONSTANT).round().astype(np.int32)
+
+
+def remove_staircases(skel: np.ndarray) -> np.ndarray:
+    """Delete the corner pixel of every L-shaped step (e.g. set N and E neighbours, empty S, SW, W).
+    Thinning leaves these on diagonal lines; they give pixels 3 neighbours, which would look
+    like junctions and cut the line. The two neighbours stay diagonally connected."""
+    img = np.pad(skel, 1)
+    for a, b, opp in (((-1, 0), (0, 1), ((1, 0), (1, -1), (0, -1))),    # N, E
+                      ((0, 1), (1, 0), ((0, -1), (-1, -1), (-1, 0))),   # E, S
+                      ((1, 0), (0, -1), ((-1, 0), (-1, 1), (0, 1))),    # S, W
+                      ((0, -1), (-1, 0), ((0, 1), (1, 1), (1, 0)))):    # W, N
+        def at(d):
+            return img[1 + d[0]:img.shape[0] - 1 + d[0], 1 + d[1]:img.shape[1] - 1 + d[1]]
+        corner = img[1:-1, 1:-1] & at(a) & at(b)
+        for d in opp:
+            corner &= ~at(d)
+        img[1:-1, 1:-1] &= ~corner
+    return img[1:-1, 1:-1]
+
+
+def prune_spurs(skel: np.ndarray, length: int) -> np.ndarray:
+    """Remove short side branches ("spurs") that thinning leaves on thick or blobby lines.
+    Classic pruning: strip line ends `length` times, then regrow only from the ends that
+    survived, so real lines get their full length back but spurs at junctions don't."""
+    if length <= 0:
+        return skel
+    pruned = skel.copy()
+    for _ in range(length):
+        ends = pruned & (neighbour_count(pruned) <= 1)
+        if not ends.any():
+            break
+        pruned &= ~ends
+    grow = pruned & (neighbour_count(pruned) == 1)
+    kernel = np.ones((3, 3), np.uint8)
+    regrown = grow
+    for _ in range(length):
+        regrown = (cv2.dilate(regrown.astype(np.uint8), kernel) > 0) & skel & ~pruned
+        regrown |= grow
+    return pruned | regrown
+
+
+def lineart_mask(gray: np.ndarray) -> np.ndarray:
+    """Dark ink pixels of a line drawing, without specks."""
+    ink = (cv2.GaussianBlur(gray, (3, 3), 0) < LINEART_THRESHOLD).astype(np.uint8)
+    if LINEART_BRIDGE_PX > 0:  # close small breaks in faint, grainy lines
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * LINEART_BRIDGE_PX + 1,) * 2)
+        ink = cv2.morphologyEx(ink, cv2.MORPH_CLOSE, k)
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(ink, connectivity=8)
+    keep = np.zeros(n, bool)
+    keep[1:] = stats[1:, cv2.CC_STAT_AREA] >= LINEART_MIN_AREA_PX
+    return keep[labels]
+
+
+def order_chain(pixels: list[tuple[int, int]]) -> tuple[list[tuple[int, int]], bool]:
+    """Order the pixels of a junction-free skeleton piece into a path. Returns (path, closed)."""
+    todo = set(pixels)
+
+    def nbrs(p):
+        return [(p[0] + dr, p[1] + dc) for dr, dc in NEIGHBOURS if (p[0] + dr, p[1] + dc) in todo]
+
+    ends = [p for p in pixels if len(nbrs(p)) <= 1]
+    start = ends[0] if ends else pixels[0]
+    path = [start]
+    todo.discard(start)
+    while True:
+        nxt = nbrs(path[-1])
+        if not nxt:
+            break
+        # prefer edge neighbours over diagonals so staircase pixels aren't skipped
+        nxt.sort(key=lambda q: abs(q[0] - path[-1][0]) + abs(q[1] - path[-1][1]))
+        path.append(nxt[0])
+        todo.discard(nxt[0])
+    return path, not ends and len(path) > 2
+
+
+def skeleton_strokes(skel: np.ndarray) -> list[np.ndarray]:
+    """Turn a 1-px skeleton into long strokes. The skeleton is cut at junctions into chains;
+    at every junction the chain ends are paired up by how straight they continue, so a line
+    that crosses or touches another runs on as one stroke instead of breaking into pieces."""
+    junction = skel & (neighbour_count(skel) >= 3)
+    n_nodes, node_lab = cv2.connectedComponents(junction.astype(np.uint8), connectivity=8)
+    chain_mask = (skel & ~junction).astype(np.uint8)
+    n_chains, chain_lab = cv2.connectedComponents(chain_mask, connectivity=8)
+
+    rows, cols = np.nonzero(chain_mask)
+    labs = chain_lab[rows, cols]
+    srt = np.argsort(labs, kind="stable")
+    groups = np.split(np.stack([rows[srt], cols[srt]], 1), np.flatnonzero(np.diff(labs[srt])) + 1)
+    nr, nc_ = np.nonzero(junction)
+    node_lab_px = node_lab[nr, nc_]
+    node_centre = np.zeros((n_nodes, 2))
+    np.add.at(node_centre, node_lab_px, np.stack([nr, nc_], 1))
+    node_centre /= np.maximum(np.bincount(node_lab_px, minlength=n_nodes), 1)[:, None]
+    h, w = skel.shape
+
+    chains, closed = [], []
+    node_ends = {}  # node -> [(chain index, end 0/1, outward direction)]
+    for g in groups:
+        if len(g) == 0:
+            continue
+        path, is_closed = order_chain([tuple(p) for p in g])
+        ci = len(chains)
+        chains.append(np.array(path, np.float32))
+        closed.append(is_closed)
+        if is_closed:
+            continue
+        touching = []
+        for p in (path[0], path[-1]):
+            touching.append(sorted({node_lab[r, c] for r, c in
+                                    ((p[0] + dr, p[1] + dc) for dr, dc in NEIGHBOURS)
+                                    if 0 <= r < h and 0 <= c < w and node_lab[r, c] > 0}))
+        if len(path) == 1:
+            # a 1-px piece between two junctions: one end faces each of them
+            touching = [touching[0][:1], touching[0][1:]]
+        for end, (p, inner) in enumerate(((path[0], path[min(6, len(path) - 1)]),
+                                          (path[-1], path[max(-7, -len(path))]))):
+            d = np.subtract(p, inner, dtype=np.float64)
+            if not d.any():  # 1-px piece: direction towards its junction
+                d = node_centre[touching[end][0]] - p if touching[end] else d
+            for node in touching[end]:
+                node_ends.setdefault(node, []).append((ci, end, d / (np.linalg.norm(d) or 1)))
+
+    # pair chain ends at each junction, straightest continuation first
+    link = {}   # (chain, end) -> (other chain, other end, node)
+    tip = {}    # (chain, end) -> node the unpaired end touches (extend the line to it)
+    for node, ends in node_ends.items():
+        cands = []
+        for i in range(len(ends)):
+            for j in range(i + 1, len(ends)):
+                (ci, ei, di), (cj, ej, dj) = ends[i], ends[j]
+                if ci != cj:
+                    cands.append((float(-di @ dj), i, j))
+        cands.sort(reverse=True)
+        used = set()
+        for straightness, i, j in cands:
+            # a junction of exactly two ends is just a bend: always join it
+            if i in used or j in used or (straightness < 0.5 and len(ends) > 2):
+                continue
+            used |= {i, j}
+            (ci, ei, _), (cj, ej, _) = ends[i], ends[j]
+            if (ci, ei) not in link and (cj, ej) not in link:
+                link[(ci, ei)] = (cj, ej, node)
+                link[(cj, ej)] = (ci, ei, node)
+        for k, (ci, ei, _) in enumerate(ends):
+            if k not in used:
+                tip.setdefault((ci, ei), node)
+
+    strokes, done = [], set()
+
+    def follow(ci, entry_end):
+        """Walk linked chains starting with chain ci entered at entry_end."""
+        pts = []
+        while ci not in done:
+            done.add(ci)
+            seg = chains[ci] if entry_end == 0 else chains[ci][::-1]
+            pts.append(seg)
+            exit_end = 1 - entry_end
+            nxt = link.get((ci, exit_end))
+            if nxt is None:
+                if (ci, exit_end) in tip:
+                    pts.append(node_centre[tip[(ci, exit_end)]][None].astype(np.float32))
+                break
+            cj, ej, node = nxt
+            pts.append(node_centre[node][None].astype(np.float32))
+            ci, entry_end = cj, ej
+        return pts
+
+    # start at chains with a free end, so each stroke runs from one free end to another
+    order = [(ci, e) for ci in range(len(chains)) if not closed[ci] for e in (0, 1)
+             if (ci, e) not in link] + [(ci, 0) for ci in range(len(chains))]
+    for ci, e in order:
+        if ci in done:
+            continue
+        head = []
+        if (ci, e) in tip:
+            head = [node_centre[tip[(ci, e)]][None].astype(np.float32)]
+        pts = follow(ci, e)
+        s = np.concatenate(head + pts)
+        if closed[ci] and len(pts) == 1:
+            s = np.concatenate([s, s[:1]])
+        strokes.append(s)
+    return strokes
+
+
+def smooth_stroke(s: np.ndarray, radius: int) -> np.ndarray:
+    """Moving average along the stroke: removes the pixel staircase, keeps the end points."""
+    if radius <= 0 or len(s) < 3:
+        return s
+    k = np.ones(2 * radius + 1) / (2 * radius + 1)
+    pad = np.pad(s, ((radius, radius), (0, 0)), mode="edge")
+    out = np.stack([np.convolve(pad[:, i], k, mode="valid") for i in range(2)], 1)
+    out[0], out[-1] = s[0], s[-1]
+    return out.astype(np.float32)
+
+
+def thick_fill_strokes(ink: np.ndarray, pen_px: float) -> list[np.ndarray]:
+    """Nested outlines, one pen width apart, filling the parts of the ink that are wider than
+    about two pen widths. Thinner lines are fully covered by their centre line already."""
+    dist = cv2.distanceTransform(ink.astype(np.uint8), cv2.DIST_L2, 5)
+    thick = dist > pen_px  # half-width > 1 pen -> line wider than 2 pens
+    if not thick.any():
+        return []
+    r = int(np.ceil(pen_px))
+    region = (cv2.dilate(thick.astype(np.uint8), cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (2 * r + 1,) * 2)) > 0) & ink
+    strokes = []
+    k = 0
+    while True:
+        level = ((dist > pen_px * (0.5 + k)) & region).astype(np.uint8)
+        if not level.any():
+            return strokes
+        contours, _ = cv2.findContours(level, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+        for cnt in contours:
+            pts = cnt.reshape(-1, 2)[:, ::-1].astype(np.float32)  # (x, y) -> (row, col)
+            strokes.append(np.concatenate([pts, pts[:1]]))
+        k += 1
+
+
+def lineart_strokes(gray: np.ndarray) -> list[np.ndarray]:
+    """Trace each drawn line once, along its centre (plus fill for very thick ink)."""
+    ink = lineart_mask(gray)
+    skel = prune_spurs(remove_staircases(thin(ink)), LINEART_SPUR_PX)
+    strokes = [smooth_stroke(s, LINEART_SMOOTH_PX) for s in skeleton_strokes(skel)]
+    if LINEART_FILL_THICK:
+        strokes += thick_fill_strokes(ink, LINEART_PEN_MM / mm_per_pixel(gray.shape))
+    return strokes
 
 
 # --------------------------- "comic" style ---------------------------------
@@ -605,7 +857,8 @@ def trace_strokes(edges: np.ndarray) -> list[np.ndarray]:
     return strokes
 
 
-def stroke_to_mm(s: np.ndarray, shape) -> np.ndarray | None:
+def stroke_to_mm(s: np.ndarray, shape, tolerance_mm: float | None = None,
+                 min_length_mm: float | None = None) -> np.ndarray | None:
     """Pixel (row, col) polyline -> simplified mm polyline in the feature frame, or None if too short."""
     h_px, w_px = shape[:2]
     mm_per_px = mm_per_pixel(shape)
@@ -617,8 +870,10 @@ def stroke_to_mm(s: np.ndarray, shape) -> np.ndarray | None:
     if FLIP_Y:
         y = height_mm - y
     pts = np.stack([x + OFFSET_X_MM, y + OFFSET_Y_MM], axis=1).astype(np.float32)
-    pts = cv2.approxPolyDP(pts.reshape(-1, 1, 2), SIMPLIFY_TOLERANCE_MM, False).reshape(-1, 2)
-    if len(pts) < 2 or np.linalg.norm(np.diff(pts, axis=0), axis=1).sum() < MIN_LINE_LENGTH_MM:
+    tol = SIMPLIFY_TOLERANCE_MM if tolerance_mm is None else tolerance_mm
+    min_len = MIN_LINE_LENGTH_MM if min_length_mm is None else min_length_mm
+    pts = cv2.approxPolyDP(pts.reshape(-1, 1, 2), tol, False).reshape(-1, 2)
+    if len(pts) < 2 or np.linalg.norm(np.diff(pts, axis=0), axis=1).sum() < min_len:
         return None
     return pts
 
@@ -686,19 +941,24 @@ class Result:
 
 def process(img: np.ndarray, style: str) -> Result:
     """Run the full pipeline on a BGR image using the current module settings."""
-    gray, bgr = prepare(img)
+    gray, bgr = prepare(img, LINEART_RESOLUTION_PX if style == "lineart" else None)
     cols = active_colours()
     labels = colour_labels(bgr)
 
     comic = None
     if style == "comic":
         pixel_strokes, comic = comic_strokes(gray, labels)
+    elif style == "lineart":
+        pixel_strokes = [p for s in lineart_strokes(gray) for p in split_by_colour(s, labels)]
     else:
         pixel_strokes = [p for s in edge_strokes(gray) for p in split_by_colour(s, labels)]
 
     layers = {c: [] for c in cols}
     for label, s in pixel_strokes:
-        pts = stroke_to_mm(s, gray.shape)
+        if style == "lineart":
+            pts = stroke_to_mm(s, gray.shape, LINEART_SIMPLIFY_MM, LINEART_MIN_LENGTH_MM)
+        else:
+            pts = stroke_to_mm(s, gray.shape)
         if pts is not None:
             layers[cols[label]].append(pts)
     layers = {c: order_strokes(strokes) for c, strokes in layers.items()}
@@ -793,11 +1053,14 @@ def render_preview(result: Result, px_per_mm: float = 5) -> np.ndarray:
     w = int((result.width_mm + abs(OFFSET_X_MM)) * px_per_mm) + 2 * margin
     h = int((result.height_mm + abs(OFFSET_Y_MM)) * px_per_mm) + 2 * margin
     canvas = np.full((h, w, 3), 255, np.uint8)
+    # line art is judged against the source drawing, so show the real pen width
+    # (other styles stay 1 px: thick lines would hide the hatch spacing)
+    width = max(1, round(LINEART_PEN_MM * px_per_mm)) if result.style == "lineart" else 1
     for colour, strokes in result.layers.items():
         bgr = tuple(int(v) for v in PEN_COLOURS.get(colour, (0, 0, 0)))
         for s in strokes:
             pts = np.column_stack([s[:, 0] * px_per_mm + margin, h - margin - s[:, 1] * px_per_mm])
-            cv2.polylines(canvas, [pts.round().astype(np.int32)], False, bgr, 1, cv2.LINE_AA)
+            cv2.polylines(canvas, [pts.round().astype(np.int32)], False, bgr, width, cv2.LINE_AA)
     return canvas
 
 
@@ -807,8 +1070,9 @@ def main():
     parser.add_argument("image", type=Path, help="input image file, e.g. monalisa.png")
     parser.add_argument("-o", "--output", type=Path, help="output .script (default: <image>.script)")
     parser.add_argument("--width", type=float, help=f"drawing width in mm (default {IMAGE_WIDTH_MM})")
-    parser.add_argument("--style", choices=["edges", "comic"], default="edges",
-                        help="edges = outlines only, comic = ink lines + shading (default edges)")
+    parser.add_argument("--style", choices=["edges", "comic", "lineart"], default="edges",
+                        help="edges = outlines only, comic = ink lines + shading, "
+                             "lineart = trace an existing line drawing (default edges)")
     parser.add_argument("--colours", "--colors", dest="colours",
                         help=f"comma-separated pens to use, from: {','.join(PEN_COLOURS)}. "
                              "Writes one <name>_<colour>.script per pen.")

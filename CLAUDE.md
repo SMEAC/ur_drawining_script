@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 RobotPainter drives a Universal Robots (UR) arm to draw images. `src/image_to_urscript.py` converts an image into a line drawing and generates URScript programs from it. `urscript/URScript.script` is the original hand-written test program (a 100 mm square). There is no test suite.
 
 Layout:
-- `src/`: all code. The three scripts sit side by side, because the GUI imports `image_to_urscript` and finds `diffusion_worker.py` next to itself.
+- `src/`: all code. The scripts sit side by side, because the GUI imports `image_to_urscript` and finds the AI worker scripts next to itself, and `kontext_worker.py` imports helpers from `diffusion_worker.py`.
 - `images/`: input images.
 - `examples/`: committed sample outputs. Regenerate them with the CLI after pipeline changes.
 - `output/`: the GUI's save folder, gitignored.
@@ -20,6 +20,7 @@ Python is not on PATH; use `uv`. Each script declares its dependencies inline (P
 uv run src/image_to_urscript.py images/monalisa.png -o examples/edges/monalisa.script
 uv run src/image_to_urscript.py images/monalisa.png --style comic -o examples/comic/monalisa.script
 uv run src/image_to_urscript.py images/monalisa.png --style comic --colours black,green,red,blue -o examples/colour/monalisa.script
+uv run src/image_to_urscript.py images/monalisa_kontext.png --style lineart -o examples/lineart/monalisa.script
 ```
 
 GUI: `uv run src/robot_painter_gui.py`. It offers drag & drop (tkinterdnd2), live settings, webcam mode and a save button.
@@ -44,6 +45,13 @@ Tunable properties are module-level constants at the top of `image_to_urscript.p
   - `FILL_STYLE="lines"`: one 2-point stroke per run. The GUI's choices come from `FILL_STYLES`.
   - `FILL_DIRECTION="shape"`: `region_axis` uses image moments, and only regions with elongation ≥ `FILL_SHAPE_MIN_ELONGATION` follow their own axis. Layer angles then become relative to the first layer.
   - Jitter uses stdlib `random.Random(FILL_SEED)`, not numpy.random, whose `_pcg64` DLL is blocked by Application Control here.
+- **lineart**: the input is already a line drawing (the Kontext output). It works at `LINEART_RESOLUTION_PX`, not `WORK_RESOLUTION_PX`.
+  - Steps: threshold dark ink → `thin` → `remove_staircases` → `prune_spurs` → `skeleton_strokes` → `smooth_stroke`.
+  - `remove_staircases` matters: L-shaped steps left by thinning give pixels 3 neighbours, which would look like junctions and cut lines into pieces.
+  - `skeleton_strokes` cuts the skeleton at junctions into chains, then pairs chain ends at each junction by straightness, so each drawn line becomes one stroke.
+  - With `LINEART_FILL_THICK`, ink wider than about 2 pen widths also gets nested outlines one `LINEART_PEN_MM` apart (pupils, lashes, eyebrows).
+  - It uses its own simplify tolerance and minimum length, and the preview draws at the pen width.
+  - To check fidelity, compare against the source; it covered 99.9% of the thinned ink of `images/monalisa_kontext.png`.
 - **Shared back end**: scale to mm with image Y flipped to feature +Y → `approxPolyDP` simplify → drop short strokes → greedy nearest-neighbour ordering (strokes may be reversed) → URScript.
 
 Core API, used by both the CLI and the GUI: `process(bgr, style) -> Result` → `urscript_text(result, name, colour)` / `render_preview(result, px_per_mm)`. These functions work in memory. Only `main()` writes files.
@@ -76,6 +84,18 @@ This optional pre-step runs Stable Diffusion 1.5 img2img with a lineart ControlN
 - **Speed**: the first model load took about 8 minutes, including the download. One restyle takes about 2.2 s warm at 512 px.
 - **Caching**: the GUI caches the AI image per `(source_version, AI params)`, so changing drawing settings doesn't re-run diffusion.
 - **Self-test**: `uv run src/diffusion_worker.py --selftest images/monalisa.png` writes `images/monalisa_ai.png`.
+
+#### Second engine: FLUX.1 Kontext via Nunchaku (`kontext_worker.py`)
+
+The AI tab has a **Model** dropdown (`AI_ENGINES` in the GUI). Each engine has its own worker script, settings panel and defaults. Only one worker runs at a time: switching engines stops the other worker to free GPU memory.
+
+- **What it does**: FLUX.1 Kontext [dev] is an instruction-following image editor. It redraws the photo as line art from a text prompt and needs no control image.
+- **Same protocol**: it speaks the same protocol as `diffusion_worker.py` and reuses its `serve()`, `fit_size()` and I/O helpers.
+- **Environment**: Python 3.12, torch 2.9 from cu128, and the Nunchaku 1.2.1 wheel pinned by URL. The wheel tag must match the torch version.
+- **Precision**: `get_precision()` picks int4 (Ada, the RTX 4060 Ti 16 GB on this machine) or fp4 (Blackwell).
+- **Weights**: about 9 GB of non-gated 4-bit transformer and T5 from `nunchaku-ai/`. CLIP, VAE and tokenizers come from the **gated** `black-forest-labs/FLUX.1-Kontext-dev`. Accept the licence on its Hugging Face page and run `uvx hf auth login` once. The licence is non-commercial.
+- **Self-test**: `uv run src/kontext_worker.py --selftest images/monalisa.png` writes `images/monalisa_kontext.png`.
+- **Style lock**: the output is already line art. While Kontext is on, the GUI locks the style to `lineart` and greys out the Edges, Comic and Fill tabs (`sync_style_lock`). The lock is released, and the user's own style restored, when Kontext is turned off or its worker fails.
 
 The preview PNG is large (~1000 px). Hatching aliases badly when it is viewed scaled down, so crop it before judging the hatch layers.
 

@@ -11,8 +11,9 @@ Tk GUI for image_to_urscript.py.
 - All conversion settings are live: the preview regenerates when one changes
 - "Live webcam" re-captures and re-processes a frame every N seconds
 - "Save" (Ctrl+S) writes the source image, preview, comic image and .script
-- "AI" tab: optional Stable Diffusion + lineart ControlNet restyle before drawing,
-  run in a separate process (diffusion_worker.py) with its own heavy dependencies
+- "AI" tab: optional AI restyle before drawing, run in a separate process with its own
+  heavy dependencies. Two engines: Stable Diffusion 1.5 + lineart ControlNet
+  (diffusion_worker.py) or FLUX.1 Kontext, 4-bit via Nunchaku (kontext_worker.py)
 """
 
 import base64
@@ -78,6 +79,18 @@ TABS = {
         ("CANNY_LOW", "Canny low", "int", 0, 500, 5),
         ("CANNY_HIGH", "Canny high", "int", 0, 500, 5),
     ],
+    "Line art": [
+        ("LINEART_RESOLUTION_PX", "Work resolution (px)", "int", 300, 3000, 100),
+        ("LINEART_THRESHOLD", "Ink darker than (0-255)", "int", 1, 254, 5),
+        ("LINEART_BRIDGE_PX", "Bridge gaps (px)", "int", 0, 5, 1),
+        ("LINEART_MIN_AREA_PX", "Min speck (px)", "int", 0, 500, 5),
+        ("LINEART_SPUR_PX", "Prune spurs (px)", "int", 0, 30, 1),
+        ("LINEART_SMOOTH_PX", "Smooth lines (px)", "int", 0, 10, 1),
+        ("LINEART_SIMPLIFY_MM", "Simplify tolerance (mm)", "float", 0, 2, 0.05),
+        ("LINEART_MIN_LENGTH_MM", "Min line length (mm)", "float", 0, 20, 0.1),
+        ("LINEART_FILL_THICK", "Fill thick ink", "bool"),
+        ("LINEART_PEN_MM", "Pen width (mm)", "float", 0.1, 3, 0.05),
+    ],
     "Comic": [
         ("COMIC_INK", "Draw ink lines", "bool"),
         ("COMIC_HATCH", "Draw shading (Fill tab)", "bool"),
@@ -102,6 +115,11 @@ TABS = {
 }
 
 COLOUR_METHODS = {"hue": "Hue (paintings, photos)", "nearest": "Nearest colour (flat graphics)"}
+
+STYLES = {"edges": "Edges (outlines)", "comic": "Comic (ink + shading)",
+          "lineart": "Line art (trace a line drawing)"}
+# settings tabs that only apply to one style; greyed out while the style is locked to line art
+STYLE_TABS = {"Edges", "Comic", "Fill"}
 
 MAX_HATCH_LAYERS = 4
 EXTRA_HATCH_DEFAULTS = [(0, 3.0, 0), (90, 3.0, 0)]  # offered as disabled extra layers
@@ -154,20 +172,53 @@ class Webcam:
         self._stop.set()
 
 
-WORKER_SCRIPT = Path(__file__).with_name("diffusion_worker.py")
-
-AI_DEFAULTS = {
-    "prompt": "comic book illustration, bold black ink outlines, flat colours, clean line art",
-    "negative": "blurry, photo, noisy, grainy, text, watermark, signature",
-    "strength": 0.55, "steps": 20, "guidance": 7.0, "control_scale": 1.0, "seed": 42,
+# AI restyle engines. Each runs its own worker script (same JSON-lines protocol).
+# "text": prompt fields, "numbers": (key, label, min, max, step, is_int) spinboxes.
+AI_ENGINES = {
+    "sd15": {
+        "label": "Stable Diffusion 1.5 + lineart ControlNet",
+        "script": "diffusion_worker.py",
+        "note": "img2img guided by the photo's lines.\nFirst use downloads ~3 GB of model weights.",
+        "text": (("prompt", "Prompt"), ("negative", "Negative prompt")),
+        "numbers": (("strength", "Strength (0 = keep, 1 = repaint)", 0.05, 1.0, 0.05, False),
+                    ("control_scale", "Lineart guidance", 0.0, 2.0, 0.1, False),
+                    ("steps", "Steps", 4, 50, 1, True),
+                    ("guidance", "Prompt guidance", 1.0, 15.0, 0.5, False),
+                    ("seed", "Seed", 0, 999999, 1, True)),
+        "defaults": {
+            "prompt": "comic book illustration, bold black ink outlines, flat colours, clean line art",
+            "negative": "blurry, photo, noisy, grainy, text, watermark, signature",
+            "strength": 0.55, "steps": 20, "guidance": 7.0, "control_scale": 1.0, "seed": 42,
+        },
+    },
+    "kontext": {
+        "label": "FLUX.1 Kontext (Nunchaku 4-bit)",
+        "script": "kontext_worker.py",
+        "note": "Redraws the photo as the instruction says.\nFirst use downloads ~10 GB and "
+                "needs a Hugging Face\nlogin (see kontext_worker.py). Drawn as line art.",
+        "text": (("prompt", "Instruction"),),
+        "numbers": (("size", "Size (longest side, px)", 512, 1536, 64, True),
+                    ("steps", "Steps", 4, 50, 1, True),
+                    ("guidance", "Guidance", 1.0, 10.0, 0.5, False),
+                    ("seed", "Seed", 0, 999999, 1, True)),
+        "defaults": {
+            "prompt": ("Convert this photo into a clean black and white line drawing, colouring "
+                       "book style. Thin uniform black outlines on a plain white background. "
+                       "No shading, no hatching, no grey, no colour fill. Keep the faces and pose."),
+            "size": 1024, "steps": 20, "guidance": 2.5, "seed": 42,
+        },
+    },
 }
+AI_ENGINE_BY_LABEL = {e["label"]: key for key, e in AI_ENGINES.items()}
 
 
 class DiffusionClient:
     """Runs diffusion_worker.py as a child process (via uv, so torch etc. stay out of the
     GUI environment) and sends it one image at a time. The model is loaded once."""
 
-    def __init__(self):
+    def __init__(self, engine: str):
+        self.engine = engine
+        script = Path(__file__).with_name(AI_ENGINES[engine]["script"])
         self.state = "starting"       # starting -> ready | failed ; ready -> stopped
         self.error = None
         self.info = ""
@@ -183,7 +234,7 @@ class DiffusionClient:
             return
         self._log = open(self.log_path, "w", encoding="utf-8")
         self.proc = subprocess.Popen(
-            [uv, "run", str(WORKER_SCRIPT)], cwd=WORKER_SCRIPT.parent,
+            [uv, "run", str(script)], cwd=script.parent,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self._log,
             text=True, encoding="utf-8",
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
@@ -262,7 +313,7 @@ class App:
         self.source_name = None
         self.source_version = 0     # bumps on every new image / webcam frame
         self.job = None             # (source, name, result, scripts, elapsed, ai_img) on screen
-        self.ai = None              # DiffusionClient, started when AI is first enabled
+        self.ai = None              # DiffusionClient for the selected engine, started on enable
         self.ai_cache = None        # (key, image): skip diffusion when only drawing settings change
         self.waiting_for_ai = False
         self.busy = False
@@ -295,17 +346,26 @@ class App:
         style = ttk.LabelFrame(left, text="Style", padding=6)
         style.pack(fill="x", pady=(8, 0))
         self.style = tk.StringVar(value="comic")
-        for value, text in (("edges", "Edges (outlines)"), ("comic", "Comic (ink + shading)")):
-            ttk.Radiobutton(style, text=text, value=value, variable=self.style,
-                            command=self.request_update).pack(anchor="w")
+        self.user_style = "comic"   # restored when the AI line-art lock is released
+        self.style_buttons = {}
+        for value, text in STYLES.items():
+            rb = ttk.Radiobutton(style, text=text, value=value, variable=self.style,
+                                 command=self.on_style)
+            rb.pack(anchor="w")
+            self.style_buttons[value] = rb
+        self.style_lock_note = ttk.Label(style, text="Locked to line art: the AI drawing is "
+                                         "traced line for line", foreground="#666", wraplength=280)
 
         self._build_pens(left)
 
         nb = ttk.Notebook(left)
         nb.pack(fill="both", expand=True, pady=8)
+        self.nb = nb
+        self.tab_frames = {}
         for tab, specs in TABS.items():
             frame = ttk.Frame(nb, padding=6)
             nb.add(frame, text=tab)
+            self.tab_frames[tab] = frame
             offset = 0
             if tab == "Colour":
                 ttk.Label(frame, text="Method").grid(row=0, column=0, sticky="w")
@@ -348,52 +408,112 @@ class App:
         self.ai_enabled = tk.BooleanVar(value=False)
         ttk.Checkbutton(frame, text="AI restyle before drawing", variable=self.ai_enabled,
                         command=self.toggle_ai).grid(row=0, column=0, columnspan=2, sticky="w")
-        ttk.Label(frame, text="Stable Diffusion 1.5 img2img + lineart ControlNet.\n"
-                              "First use downloads ~3 GB of model weights.",
-                  foreground="#666").grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 6))
-        self.ai_vars = {}
-        row = 2
-        for key, label in (("prompt", "Prompt"), ("negative", "Negative prompt")):
-            ttk.Label(frame, text=label).grid(row=row, column=0, columnspan=2, sticky="w")
-            var = tk.StringVar(value=AI_DEFAULTS[key])
-            entry = ttk.Entry(frame, textvariable=var, width=34)
-            entry.grid(row=row + 1, column=0, columnspan=2, sticky="ew", pady=(0, 4))
-            # text fields only re-run on Enter / leaving the field, not on every keystroke
-            entry.bind("<Return>", lambda e: self.request_update())
-            entry.bind("<FocusOut>", lambda e: self.request_update())
-            self.ai_vars[key] = var
-            row += 2
-        for key, label, lo, hi, step, is_int in (
-                ("strength", "Strength (0 = keep, 1 = repaint)", 0.05, 1.0, 0.05, False),
-                ("control_scale", "Lineart guidance", 0.0, 2.0, 0.1, False),
-                ("steps", "Steps", 4, 50, 1, True),
-                ("guidance", "Prompt guidance", 1.0, 15.0, 0.5, False),
-                ("seed", "Seed", 0, 999999, 1, True)):
-            var = tk.IntVar(value=AI_DEFAULTS[key]) if is_int else tk.DoubleVar(value=AI_DEFAULTS[key])
-            ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", pady=1)
-            ttk.Spinbox(frame, from_=lo, to=hi, increment=step, textvariable=var,
-                        width=9).grid(row=row, column=1, sticky="e", pady=1)
-            var.trace_add("write", lambda *_: self.request_update())
-            self.ai_vars[key] = var
-            row += 1
+        ttk.Label(frame, text="Model").grid(row=1, column=0, sticky="w")
+        self.ai_engine = tk.StringVar(value=AI_ENGINES["sd15"]["label"])
+        cb = ttk.Combobox(frame, textvariable=self.ai_engine, state="readonly", width=34,
+                          values=[e["label"] for e in AI_ENGINES.values()])
+        cb.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(0, 4))
+        cb.bind("<<ComboboxSelected>>", lambda e: self.toggle_ai())
+
+        # one settings panel per engine; only the selected one is shown
+        self.ai_vars = {}     # engine -> {key: tk variable}
+        self.ai_panels = {}
+        for engine, spec in AI_ENGINES.items():
+            panel = ttk.Frame(frame)
+            panel.grid(row=3, column=0, columnspan=2, sticky="ew")
+            panel.columnconfigure(0, weight=1)
+            self.ai_panels[engine] = panel
+            vars_ = self.ai_vars[engine] = {}
+            defaults = spec["defaults"]
+            ttk.Label(panel, text=spec["note"], foreground="#666").grid(
+                row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+            row = 1
+            for key, label in spec["text"]:
+                ttk.Label(panel, text=label).grid(row=row, column=0, columnspan=2, sticky="w")
+                var = tk.StringVar(value=defaults[key])
+                entry = ttk.Entry(panel, textvariable=var, width=34)
+                entry.grid(row=row + 1, column=0, columnspan=2, sticky="ew", pady=(0, 4))
+                # text fields only re-run on Enter / leaving the field, not on every keystroke
+                entry.bind("<Return>", lambda e: self.request_update())
+                entry.bind("<FocusOut>", lambda e: self.request_update())
+                vars_[key] = var
+                row += 2
+            for key, label, lo, hi, step, is_int in spec["numbers"]:
+                var = tk.IntVar(value=defaults[key]) if is_int else tk.DoubleVar(value=defaults[key])
+                ttk.Label(panel, text=label).grid(row=row, column=0, sticky="w", pady=1)
+                ttk.Spinbox(panel, from_=lo, to=hi, increment=step, textvariable=var,
+                            width=9).grid(row=row, column=1, sticky="e", pady=1)
+                var.trace_add("write", lambda *_: self.request_update())
+                vars_[key] = var
+                row += 1
         self.ai_status = ttk.Label(frame, text="AI off", foreground="#555", wraplength=300)
-        self.ai_status.grid(row=row, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.ai_status.grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.show_ai_panel()
+
+    def selected_engine(self) -> str:
+        return AI_ENGINE_BY_LABEL.get(self.ai_engine.get(), "sd15")
+
+    def show_ai_panel(self):
+        for engine, panel in self.ai_panels.items():
+            if engine == self.selected_engine():
+                panel.grid()
+            else:
+                panel.grid_remove()
 
     def toggle_ai(self):
+        """AI checkbox or model choice changed: start the worker for the selected engine.
+        Only one worker runs at a time, so switching frees the other model's GPU memory."""
+        engine = self.selected_engine()
+        self.show_ai_panel()
+        if self.ai is not None and self.ai.engine != engine:
+            self.ai.stop()
+            self.ai = None
         if self.ai_enabled.get() and (self.ai is None or self.ai.state in ("failed", "stopped")):
-            self.ai = DiffusionClient()
+            self.ai = DiffusionClient(engine)
+        self.sync_style_lock()
+        self.request_update()
+
+    def on_style(self):
+        self.user_style = self.style.get()
+        self.request_update()
+
+    def line_art_locked(self) -> bool:
+        """Kontext already draws the line drawing, so the pipeline must only trace it.
+        Released if its worker failed, since the plain photo is drawn instead then."""
+        return (self.ai_enabled.get() and self.selected_engine() == "kontext"
+                and not (self.ai and self.ai.state in ("failed", "stopped")))
+
+    def sync_style_lock(self):
+        """Force the line-art style while Kontext is on, and grey out the other styles and
+        their settings tabs. Restores the user's own style choice afterwards."""
+        locked = self.line_art_locked()
+        if locked == getattr(self, "_style_locked", False):
+            return
+        self._style_locked = locked
+        self.style.set("lineart" if locked else self.user_style)
+        for value, rb in self.style_buttons.items():
+            rb.configure(state="disabled" if locked and value != "lineart" else "normal")
+        for tab in STYLE_TABS:
+            self.nb.tab(self.tab_frames[tab], state="disabled" if locked else "normal")
+        if locked:
+            self.style_lock_note.pack(anchor="w", pady=(4, 0))
+            if self.nb.tab(self.nb.select(), "text") in STYLE_TABS:
+                self.nb.select(self.tab_frames["Line art"])
+        else:
+            self.style_lock_note.pack_forget()
         self.request_update()
 
     def ai_params(self) -> dict | None:
-        """Current AI settings, or None if AI restyle is off."""
+        """Current settings of the selected AI engine, or None if AI restyle is off."""
         if not self.ai_enabled.get():
             return None
+        engine = self.selected_engine()
         params = {}
-        for key, var in self.ai_vars.items():
+        for key, var in self.ai_vars[engine].items():
             try:
                 params[key] = var.get()
             except tk.TclError:
-                params[key] = AI_DEFAULTS[key]
+                params[key] = AI_ENGINES[engine]["defaults"][key]
         return params
 
     def update_ai_status(self):
@@ -404,7 +524,7 @@ class App:
         elif self.ai.state == "starting":
             text = f"Starting AI worker… {self.ai.last_log_line()}"
         elif self.ai.state == "ready":
-            text = f"AI ready ({self.ai.info})"
+            text = f"AI ready: {AI_ENGINES[self.ai.engine]['label']} ({self.ai.info})"
         else:
             text = f"AI unavailable: {self.ai.error}\nLog: {self.ai.log_path}"
         if self.ai_status.cget("text") != text:
@@ -620,7 +740,7 @@ class App:
             if self.ai.state != "ready":
                 ai_params = None             # failed: draw without AI, the AI tab shows why
             else:
-                ai_key = (self.source_version, tuple(sorted(ai_params.items())))
+                ai_key = (self.source_version, self.ai.engine, tuple(sorted(ai_params.items())))
                 if self.ai_cache and self.ai_cache[0] == ai_key:
                     cached = self.ai_cache[1]
         self.apply_settings()
@@ -666,6 +786,7 @@ class App:
             pass
         if self.ai is not None or self.ai_enabled.get():
             self.update_ai_status()
+            self.sync_style_lock()  # releases the line-art lock if the worker failed
         if self.waiting_for_ai and (self.ai is None or self.ai.state != "starting"):
             self.waiting_for_ai = False
             self.start_job()
@@ -749,12 +870,15 @@ class App:
                 (angle, spacing, max_tone), on = EXTRA_HATCH_DEFAULTS[i - len(self.default_layers)], False
             for v, value in zip(vs, (on, angle, spacing, max_tone)):
                 v.set(value)
-        self.style.set("comic")
+        self.user_style = "comic"
+        if not self.line_art_locked():
+            self.style.set("comic")
         for var in self.pen_vars.values():
             var.set(True)
         self.colour_method.set(COLOUR_METHODS["hue"])
-        for key, var in self.ai_vars.items():
-            var.set(AI_DEFAULTS[key])
+        for engine, vars_ in self.ai_vars.items():
+            for key, var in vars_.items():
+                var.set(AI_ENGINES[engine]["defaults"][key])
         self.request_update()
 
     def choose_dir(self):

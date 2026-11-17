@@ -33,6 +33,7 @@ Protocol (one JSON object per line):
 Log output goes to stderr.
 
 Self-test:  uv run src/diffusion_worker.py --selftest images/monalisa.png
+kontext_worker.py speaks the same protocol and reuses serve() and the helpers here.
 """
 
 import json
@@ -79,11 +80,12 @@ def read_bgr(path):
     return img
 
 
-def fit_size(img):
-    """Resize so the longest side is SIZE and both sides are multiples of 8."""
+def fit_size(img, size=SIZE, multiple=8):
+    """Resize so the longest side is about `size` and both sides are multiples of `multiple`."""
     h, w = img.shape[:2]
-    s = SIZE / max(h, w)
-    nw, nh = max(8, round(w * s / 8) * 8), max(8, round(h * s / 8) * 8)
+    s = size / max(h, w)
+    m = multiple
+    nw, nh = max(m, round(w * s / m) * m), max(m, round(h * s / m) * m)
     return cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA)
 
 
@@ -149,19 +151,21 @@ def generate(pipe, device, req):
     buf.tofile(req["out"])
 
 
-def main():
+def serve(load, generate, argv):
+    """Shared worker main loop (also used by kontext_worker.py).
+    load() -> (pipe, device); generate(pipe, device, request_dict) writes request["out"]."""
     t0 = time.perf_counter()
     try:
-        pipe, device = load_pipeline()
+        pipe, device = load()
     except Exception as e:
         traceback.print_exc()
         reply({"ready": False, "error": f"{type(e).__name__}: {e}"})
         return 1
     reply({"ready": True, "device": device, "load_s": round(time.perf_counter() - t0, 1)})
 
-    if len(sys.argv) >= 3 and sys.argv[1] == "--selftest":
-        src = sys.argv[2]
-        out = src.rsplit(".", 1)[0] + "_ai.png"
+    if len(argv) >= 3 and argv[1] == "--selftest":
+        src = argv[2]
+        out = src.rsplit(".", 1)[0] + (argv[3] if len(argv) > 3 else "_ai.png")
         for i in range(2):  # second run shows the warm speed
             t = time.perf_counter()
             generate(pipe, device, {"in": src, "out": out})
@@ -181,6 +185,10 @@ def main():
             traceback.print_exc()
             reply({"ok": False, "error": f"{type(e).__name__}: {e}"})
     return 0
+
+
+def main():
+    return serve(load_pipeline, generate, sys.argv)
 
 
 if __name__ == "__main__":
