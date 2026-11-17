@@ -51,6 +51,9 @@ Tunable properties are module-level constants at the top of `image_to_urscript.p
   - `skeleton_strokes` cuts the skeleton at junctions into chains, then pairs chain ends at each junction by straightness, so each drawn line becomes one stroke.
   - With `LINEART_FILL_THICK`, ink wider than about 2 pen widths also gets nested outlines one `LINEART_PEN_MM` apart (pupils, lashes, eyebrows).
   - It uses its own simplify tolerance and minimum length, and the preview draws at the pen width.
+  - **Pen colours**: `colour_labels()` blurs and smooths for photo areas, which erases thin coloured lines (they all came out black). Line art therefore uses `lineart_colour_labels()`: each ink pixel keeps its own pen, pale anti-aliased edges take the colour of the line core, and other pixels take the pen of the nearest ink pixel.
+  - `COLOUR_MIN_RUN_PX` is scaled from `WORK_RESOLUTION_PX` to the line-art resolution, so a line crossing another doesn't take its colour there.
+  - `LINEART_COLOUR_SOURCE`: `"drawing"` (default) uses the line's own colour. `"photo"` uses the original photo, passed as `process(..., colour_source=)` (CLI `--colour-from`), with the photo hue rules; skin and blond hair go red, so it is rarely better.
   - To check fidelity, compare against the source; it covered 99.9% of the thinned ink of `images/monalisa_kontext.png`.
 - **Shared back end**: scale to mm with image Y flipped to feature +Y → `approxPolyDP` simplify → drop short strokes → greedy nearest-neighbour ordering (strokes may be reversed) → URScript.
 
@@ -95,6 +98,9 @@ The AI tab has a **Model** dropdown (`AI_ENGINES` in the GUI). Each engine has i
 - **Precision**: `get_precision()` picks int4 (Ada, the RTX 4060 Ti 16 GB on this machine) or fp4 (Blackwell).
 - **Weights**: about 9 GB of non-gated 4-bit transformer and T5 from `nunchaku-ai/`. CLIP, VAE and tokenizers come from the **gated** `black-forest-labs/FLUX.1-Kontext-dev`. Accept the licence on its Hugging Face page and run `uvx hf auth login` once. The licence is non-commercial.
 - **Self-test**: `uv run src/kontext_worker.py --selftest images/monalisa.png` writes `images/monalisa_kontext.png`.
+- **Output size**: the diffusers pipeline rescales its output to `max_area` (default 1 MP) while the input stays at the requested size. That offset the drawing against the photo, and made the Size setting useless. The worker therefore passes `max_area = h*w`.
+- **Speed**: about 35–40 s per image at 1024 px on the 4060 Ti; worker start-up takes 12–20 s once cached.
+- **Colour prompts**: Kontext ignores palette lists such as "use four pen colours (black, green, red, blue)" and draws black. It does draw coloured lines when each colour is tied to an object ("red outlines on the tulips, green on the stems, black elsewhere"). Generic wording like "outline red objects in red" gave coloured *fills* and black tulips.
 - **Style lock**: the output is already line art. While Kontext is on, the GUI locks the style to `lineart` and greys out the Edges, Comic and Fill tabs (`sync_style_lock`). The lock is released, and the user's own style restored, when Kontext is turned off or its worker fails.
 
 The preview PNG is large (~1000 px). Hatching aliases badly when it is viewed scaled down, so crop it before judging the hatch layers.

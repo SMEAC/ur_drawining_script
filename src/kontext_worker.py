@@ -108,7 +108,11 @@ def generate(pipe, device, req):
         image=image, prompt=p["prompt"], height=h, width=w,
         num_inference_steps=int(p["steps"]), guidance_scale=float(p["guidance"]),
         generator=torch.Generator(device=device).manual_seed(int(p["seed"])),
-        _auto_resize=False,  # keep our size and aspect instead of snapping to ~1 MP
+        # Output size = input size, so the drawing lines up pixel for pixel with the photo
+        # (line colours are taken from the photo). Without max_area the pipeline rescales
+        # the output to ~1 MP while the input stays at h x w, which offsets the drawing.
+        max_area=h * w,
+        _auto_resize=False,  # keep our size and aspect instead of a preferred Kontext size
     ).images[0]
     bgr = cv2.cvtColor(np.array(out), cv2.COLOR_RGB2BGR)
     ok, buf = cv2.imencode(".png", bgr)

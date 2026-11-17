@@ -118,6 +118,14 @@ LINEART_MIN_LENGTH_MM = 0.8   # shorter strokes are dropped (lashes and teeth ar
 LINEART_FILL_THICK = True     # fill ink wider than ~2 pen widths (pupils, bold lashes)
                               # with nested outlines, instead of only its centre line
 LINEART_PEN_MM = 0.5          # pen line width, the spacing of those nested outlines
+# Where line colours come from (only with more than one pen):
+#   "drawing" – the colour each line is drawn in. With the AI restyle, ask for colours by
+#               object in the instruction ("red lines for the tulips, green for the stems").
+#   "photo"   – the original photo under each line (the AI drawing lines up with it); uses
+#               the Colour tab's hue rules, which send skin and blond hair to red. Without
+#               a source photo it falls back to "drawing".
+LINEART_COLOUR_SOURCE = "drawing"
+LINEART_COLOUR_SOURCES = ["drawing", "photo"]
 
 # --- "comic" style ---
 COMIC_INK = True    # draw ink lines
@@ -217,13 +225,10 @@ def active_colours() -> list[str]:
 
 # --------------------------- colour assignment ------------------------------
 
-def colour_labels(bgr: np.ndarray) -> np.ndarray:
-    """Per-pixel index into active_colours(): which pen should draw here."""
+def pen_labels(img: np.ndarray) -> np.ndarray:
+    """Per-pixel index into active_colours() of the pen closest in colour (no smoothing)."""
     cols = active_colours()
-    h, w = bgr.shape[:2]
-    if len(cols) == 1:
-        return np.zeros((h, w), np.uint8)
-    img = cv2.medianBlur(bgr, 5)
+    h, w = img.shape[:2]
     pens = np.array([PEN_COLOURS[c] for c in cols], np.uint8).reshape(1, -1, 3)
 
     if COLOUR_METHOD == "nearest":
@@ -248,8 +253,17 @@ def colour_labels(bgr: np.ndarray) -> np.ndarray:
         if black is not None:
             grey_or_dark = (sat < COLOUR_MIN_SATURATION) | (val < COLOUR_DARK_VALUE)
             labels = np.where(grey_or_dark, black, labels)
+    return labels.astype(np.uint8)
 
-    labels = labels.astype(np.uint8)
+
+def colour_labels(bgr: np.ndarray) -> np.ndarray:
+    """Per-pixel index into active_colours(): which pen should draw here. Made for photos:
+    smoothed, so colours follow areas (use lineart_colour_labels for thin drawn lines)."""
+    h, w = bgr.shape[:2]
+    if len(active_colours()) == 1:
+        return np.zeros((h, w), np.uint8)
+    img = cv2.medianBlur(bgr, 5)
+    labels = pen_labels(img)
 
     # Paper (white/light grey) has no pen colour of its own: give it the colour of the
     # nearest non-paper pixel, so an outline between a red object and white paper is red.
@@ -277,9 +291,12 @@ def colour_map_image(labels: np.ndarray) -> np.ndarray:
     return cv2.addWeighted(img, 0.6, np.full_like(img, 255), 0.4, 0)
 
 
-def split_by_colour(stroke: np.ndarray, labels: np.ndarray) -> list[tuple[int, np.ndarray]]:
+def split_by_colour(stroke: np.ndarray, labels: np.ndarray,
+                    min_run: float | None = None) -> list[tuple[int, np.ndarray]]:
     """Cut a pixel polyline (row, col) wherever the pen colour underneath changes.
-    Short colour runs are merged into the previous run to avoid confetti."""
+    Short colour runs (< min_run px, default COLOUR_MIN_RUN_PX) are merged into the
+    previous run to avoid confetti."""
+    min_run = COLOUR_MIN_RUN_PX if min_run is None else min_run
     rows = np.clip(np.round(stroke[:, 0]).astype(int), 0, labels.shape[0] - 1)
     cols = np.clip(np.round(stroke[:, 1]).astype(int), 0, labels.shape[1] - 1)
     lab = labels[rows, cols]
@@ -290,11 +307,11 @@ def split_by_colour(stroke: np.ndarray, labels: np.ndarray) -> list[tuple[int, n
     runs = [[int(lab[s]), s, e] for s, e in zip(starts, np.r_[starts[1:], len(lab)])]
     merged = []
     for run in runs:
-        if merged and (run[2] - run[1] < COLOUR_MIN_RUN_PX or merged[-1][0] == run[0]):
+        if merged and (run[2] - run[1] < min_run or merged[-1][0] == run[0]):
             merged[-1][2] = run[2]
         else:
             merged.append(run)
-    if len(merged) > 1 and merged[0][2] - merged[0][1] < COLOUR_MIN_RUN_PX:
+    if len(merged) > 1 and merged[0][2] - merged[0][1] < min_run:
         merged[1][1] = 0
         merged.pop(0)
     # neighbouring pieces share their boundary point so the line stays continuous
@@ -535,9 +552,32 @@ def thick_fill_strokes(ink: np.ndarray, pen_px: float) -> list[np.ndarray]:
         k += 1
 
 
-def lineart_strokes(gray: np.ndarray) -> list[np.ndarray]:
+def lineart_colour_labels(bgr: np.ndarray, ink: np.ndarray) -> np.ndarray:
+    """Pen per pixel for a coloured line drawing: each ink pixel keeps the pen of its own
+    colour (no area smoothing, which would wipe out thin coloured lines), and every other
+    pixel takes the pen of the nearest ink pixel."""
+    h, w = bgr.shape[:2]
+    if len(active_colours()) == 1 or not ink.any():
+        return np.zeros((h, w), np.uint8)
+    labels = pen_labels(cv2.GaussianBlur(bgr, (3, 3), 0))
+    # the saturated core of a coloured line decides; its pale anti-aliased edge must not turn
+    # it black, so ink pixels next to a coloured pixel of the same line take that colour
+    black = active_colours().index("black") if "black" in active_colours() else None
+    if black is not None:
+        coloured = np.where(ink & (labels != black), labels, 0).astype(np.uint8)
+        spread = cv2.dilate(coloured, np.ones((3, 3), np.uint8))  # pen indices are small ints
+        labels = np.where(ink & (labels == black) & (spread > 0) & (spread != black), spread, labels)
+    _, nearest = cv2.distanceTransformWithLabels(
+        (~ink).astype(np.uint8), cv2.DIST_L2, 5, labelType=cv2.DIST_LABEL_PIXEL)
+    lut = np.zeros(int(nearest.max()) + 1, np.uint8)
+    lut[nearest[ink]] = labels[ink]
+    return lut[nearest]
+
+
+def lineart_strokes(gray: np.ndarray, ink: np.ndarray | None = None) -> list[np.ndarray]:
     """Trace each drawn line once, along its centre (plus fill for very thick ink)."""
-    ink = lineart_mask(gray)
+    if ink is None:
+        ink = lineart_mask(gray)
     skel = prune_spurs(remove_staircases(thin(ink)), LINEART_SPUR_PX)
     strokes = [smooth_stroke(s, LINEART_SMOOTH_PX) for s in skeleton_strokes(skel)]
     if LINEART_FILL_THICK:
@@ -939,17 +979,30 @@ class Result:
         return sum(self.est_times.values())
 
 
-def process(img: np.ndarray, style: str) -> Result:
-    """Run the full pipeline on a BGR image using the current module settings."""
+def process(img: np.ndarray, style: str, colour_source: np.ndarray | None = None) -> Result:
+    """Run the full pipeline on a BGR image using the current module settings.
+    colour_source: the photo `img` was drawn from (AI restyle), used for line-art colours."""
     gray, bgr = prepare(img, LINEART_RESOLUTION_PX if style == "lineart" else None)
     cols = active_colours()
-    labels = colour_labels(bgr)
+    ink = lineart_mask(gray) if style == "lineart" else None
+    if style != "lineart":
+        labels = colour_labels(bgr)
+    elif LINEART_COLOUR_SOURCE == "photo" and colour_source is not None:
+        # the AI keeps the photo's layout, so the photo resized onto the drawing lines up
+        photo = colour_source if colour_source.ndim == 3 else cv2.cvtColor(colour_source, cv2.COLOR_GRAY2BGR)
+        labels = colour_labels(cv2.resize(photo, (bgr.shape[1], bgr.shape[0]), interpolation=cv2.INTER_AREA))
+    else:
+        labels = lineart_colour_labels(bgr, ink)
 
     comic = None
     if style == "comic":
         pixel_strokes, comic = comic_strokes(gray, labels)
     elif style == "lineart":
-        pixel_strokes = [p for s in lineart_strokes(gray) for p in split_by_colour(s, labels)]
+        # COLOUR_MIN_RUN_PX is tuned for WORK_RESOLUTION_PX; scale it to the line-art
+        # resolution so a line crossing another one doesn't take its colour there
+        min_run = COLOUR_MIN_RUN_PX * max(gray.shape) / WORK_RESOLUTION_PX
+        pixel_strokes = [p for s in lineart_strokes(gray, ink)
+                         for p in split_by_colour(s, labels, min_run)]
     else:
         pixel_strokes = [p for s in edge_strokes(gray) for p in split_by_colour(s, labels)]
 
@@ -1073,6 +1126,9 @@ def main():
     parser.add_argument("--style", choices=["edges", "comic", "lineart"], default="edges",
                         help="edges = outlines only, comic = ink lines + shading, "
                              "lineart = trace an existing line drawing (default edges)")
+    parser.add_argument("--colour-from", type=Path, metavar="PHOTO",
+                        help="(lineart) take line colours from this photo, e.g. the original "
+                             "photo an AI line drawing was made from")
     parser.add_argument("--colours", "--colors", dest="colours",
                         help=f"comma-separated pens to use, from: {','.join(PEN_COLOURS)}. "
                              "Writes one <name>_<colour>.script per pen.")
@@ -1093,7 +1149,8 @@ def main():
         img = read_image(args.image)
     except ValueError as e:
         raise SystemExit(str(e))
-    result = process(img, args.style)
+    colour_source = read_image(args.colour_from) if args.colour_from else None
+    result = process(img, args.style, colour_source)
 
     written = []
     for colour, strokes in result.layers.items():

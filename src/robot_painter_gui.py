@@ -88,6 +88,7 @@ TABS = {
         ("LINEART_SMOOTH_PX", "Smooth lines (px)", "int", 0, 10, 1),
         ("LINEART_SIMPLIFY_MM", "Simplify tolerance (mm)", "float", 0, 2, 0.05),
         ("LINEART_MIN_LENGTH_MM", "Min line length (mm)", "float", 0, 20, 0.1),
+        ("LINEART_COLOUR_SOURCE", "Colours from (multi-pen)", "choice", core.LINEART_COLOUR_SOURCES),
         ("LINEART_FILL_THICK", "Fill thick ink", "bool"),
         ("LINEART_PEN_MM", "Pen width (mm)", "float", 0.1, 3, 0.05),
     ],
@@ -195,7 +196,9 @@ AI_ENGINES = {
         "label": "FLUX.1 Kontext (Nunchaku 4-bit)",
         "script": "kontext_worker.py",
         "note": "Redraws the photo as the instruction says.\nFirst use downloads ~10 GB and "
-                "needs a Hugging Face\nlogin (see kontext_worker.py). Drawn as line art.",
+                "needs a Hugging Face\nlogin (see kontext_worker.py). Drawn as line art.\n"
+                "For colour pens, name a colour per object, e.g.\n\"red lines for the tulips, "
+                "green for stems,\nblack for everything else\".",
         "text": (("prompt", "Instruction"),),
         "numbers": (("size", "Size (longest side, px)", 512, 1536, 64, True),
                     ("steps", "Steps", 4, 50, 1, True),
@@ -470,6 +473,8 @@ class App:
             self.ai = None
         if self.ai_enabled.get() and (self.ai is None or self.ai.state in ("failed", "stopped")):
             self.ai = DiffusionClient(engine)
+        if not (self.job and self.job[5] is not None):
+            self.show_ai_image(None)
         self.sync_style_lock()
         self.request_update()
 
@@ -589,13 +594,13 @@ class App:
     def _build_views(self):
         right = ttk.Frame(self.root, padding=8)
         right.pack(side="left", fill="both", expand=True)
-        right.columnconfigure(0, weight=2, uniform="v")
-        right.columnconfigure(1, weight=3, uniform="v")
+        for col in range(3):  # source | AI-styled source | robot drawing, equal widths
+            right.columnconfigure(col, weight=1, uniform="v")
         right.rowconfigure(1, weight=1)
 
-        self.source_title = ttk.Label(right, text="Source")
-        self.source_title.grid(row=0, column=0, sticky="w")
-        ttk.Label(right, text="Robot drawing preview").grid(row=0, column=1, sticky="w")
+        ttk.Label(right, text="Source").grid(row=0, column=0, sticky="w")
+        ttk.Label(right, text="Source (AI styled)").grid(row=0, column=1, sticky="w")
+        ttk.Label(right, text="Robot drawing preview").grid(row=0, column=2, sticky="w")
 
         self.source_panel = tk.Frame(right, bg="#e8e8e8", highlightthickness=2,
                                      highlightbackground="#b0b0b0")
@@ -608,15 +613,23 @@ class App:
         for w in (self.source_panel, self.source_label):
             w.bind("<Button-1>", lambda e: self.open_dialog())
 
+        self.ai_panel = tk.Frame(right, bg="#f4f4f4", highlightthickness=1,
+                                 highlightbackground="#b0b0b0")
+        self.ai_panel.grid(row=1, column=1, sticky="nsew", padx=(0, 6))
+        self.ai_panel.grid_propagate(False)
+        self.ai_label = tk.Label(self.ai_panel, text="AI restyle off\n(AI tab)", bg="#f4f4f4",
+                                 fg="#777", font=("Segoe UI", 11))
+        self.ai_label.place(relx=0.5, rely=0.5, anchor="center")
+
         self.preview_panel = tk.Frame(right, bg="white", highlightthickness=1,
                                       highlightbackground="#b0b0b0")
-        self.preview_panel.grid(row=1, column=1, sticky="nsew")
+        self.preview_panel.grid(row=1, column=2, sticky="nsew")
         self.preview_panel.grid_propagate(False)
         self.preview_label = tk.Label(self.preview_panel, bg="white")
         self.preview_label.place(relx=0.5, rely=0.5, anchor="center")
 
         info = ttk.Frame(right)
-        info.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        info.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(8, 0))
         self.comic_label = tk.Label(info)
         self.comic_label.pack(side="left", padx=(0, 6))
         self.colour_label = tk.Label(info)
@@ -627,9 +640,9 @@ class App:
         self.colour_rows.pack(side="left", anchor="n", padx=(24, 0))
 
         self.status = ttk.Label(right, text="", foreground="#555")
-        self.status.grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.status.grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
-        for panel in (self.source_panel, self.preview_panel):
+        for panel in (self.source_panel, self.ai_panel, self.preview_panel):
             panel.bind("<Configure>", self.on_resize)
 
     # ------------------------------------------------------------ sources
@@ -658,6 +671,8 @@ class App:
         self.source, self.source_name = img, name
         self.source_version += 1
         self.show_source(img)
+        if self.ai_enabled.get():
+            self.show_ai_image(None)  # "AI restyling…" until the new AI image is ready
         self.start_job()
 
     def show_source(self, img):
@@ -754,7 +769,10 @@ class App:
                 ai_img = None
                 if ai_params is not None:
                     ai_img = cached if cached is not None else ai.restyle(source, ai_params)[0]
-                result = core.process(ai_img if ai_img is not None else source, style)
+                if ai_img is not None:  # line art from the AI image, colours from the photo
+                    result = core.process(ai_img, style, colour_source=source)
+                else:
+                    result = core.process(source, style)
                 scripts = {c: core.urscript_text(result, name, c)
                            for c, strokes in result.layers.items() if strokes}
                 elapsed = time.perf_counter() - t0
@@ -797,8 +815,9 @@ class App:
         if not self.job:
             return
         source, name, result, scripts, elapsed, ai_img = self.job
-        self.show_source(self.displayed_source())
-        self.source_title.configure(text="Source (AI restyled)" if ai_img is not None else "Source")
+        # all three panels show the same job, so they always belong together (webcam too)
+        self.show_source(source)
+        self.show_ai_image(ai_img)
         p = self.preview_panel
         avail_w, avail_h = max(p.winfo_width() - 8, 50), max(p.winfo_height() - 8, 50)
         span_w = result.width_mm + abs(core.OFFSET_X_MM) + 2
@@ -847,16 +866,25 @@ class App:
 
         def redraw():
             self._resize = None
-            if self.source is not None:
-                self.show_source(self.displayed_source())
-            self.show_result()
+            if self.job:
+                self.show_result()
+            elif self.source is not None:
+                self.show_source(self.source)
         self._resize = self.root.after(150, redraw)
 
-    def displayed_source(self):
-        """The AI-restyled image if the current preview was made from one, else the source."""
-        if self.job and self.job[5] is not None and self.job[0] is self.source:
-            return self.job[5]
-        return self.source
+    def show_ai_image(self, img):
+        """Middle panel: the AI-styled image of the current preview, or why there is none."""
+        if img is None:
+            text = ("AI restyle off\n(AI tab)" if not self.ai_enabled.get()
+                    else "AI unavailable\n(see AI tab)" if self.ai and self.ai.state == "failed"
+                    else "AI restyling…")
+            self.ai_label.configure(image="", text=text)
+            self.ai_label.image = None
+            return
+        p = self.ai_panel
+        photo = to_photo(img, max(p.winfo_width() - 8, 50), max(p.winfo_height() - 8, 50))
+        self.ai_label.configure(image=photo, text="")
+        self.ai_label.image = photo
 
     # ------------------------------------------------------------- actions
     def reset(self):
