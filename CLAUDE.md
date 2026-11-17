@@ -21,6 +21,7 @@ uv run src/image_to_urscript.py images/monalisa.png -o examples/edges/monalisa.s
 uv run src/image_to_urscript.py images/monalisa.png --style comic -o examples/comic/monalisa.script
 uv run src/image_to_urscript.py images/monalisa.png --style comic --colours black,green,red,blue -o examples/colour/monalisa.script
 uv run src/image_to_urscript.py images/monalisa_kontext.png --style lineart -o examples/lineart/monalisa.script
+uv run src/image_to_urscript.py images/monalisa_kontext_colour.png --style lineart --colours black,green,red,blue -o examples/lineart_colour/monalisa.script
 ```
 
 GUI: `uv run src/robot_painter_gui.py`. It offers drag & drop (tkinterdnd2), live settings, webcam mode and a save button.

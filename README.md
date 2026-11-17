@@ -2,31 +2,51 @@
 
 Turn an image into a pen drawing for a **Universal Robots (UR)** arm. The tool turns an image into strokes and writes ready-to-run **URScript** programs, one per pen colour, plus a preview of what the robot will draw.
 
-| Source | Comic style, 2 pens | AI restyle + comic, 2 pens |
+### Best result: AI colour line drawing
+
+An AI model (FLUX.1 Kontext) redraws the image as a clean, coloured line drawing. Every line is then traced into one robot pen stroke and written to the script of its pen colour.
+
+| Source | AI line drawing (FLUX.1 Kontext) | Robot drawing, 4 pens |
 |---|---|---|
-| <img src="images/monalisa.png" width="240"> | <img src="examples/colour/monalisa_preview.png" width="240"> | <img src="examples/ai/monalisa_preview.png" width="240"> |
+| <img src="images/monalisa.png" width="240"> | <img src="images/monalisa_kontext_colour.png" width="240"> | <img src="examples/lineart_colour/monalisa_preview.png" width="240"> |
+
+That gives 953 strokes, 534 black, 222 blue, 124 green and 73 red, and about 10 min of drawing. The preview is drawn at the real pen width (0.5 mm).
+
+### Other styles
+
+| Comic style, 2 pens | SD 1.5 restyle + comic, 2 pens | Kontext line art, 1 pen |
+|---|---|---|
+| <img src="examples/colour/monalisa_preview.png" width="240"> | <img src="examples/ai/monalisa_preview.png" width="240"> | <img src="examples/lineart/monalisa_preview.png" width="240"> |
 
 ## Features
 
-- **Two drawing styles**
+- **Three drawing styles**
+  - `lineart`: traces a line drawing (for example the AI output) line for line. Each drawn line becomes one pen stroke along its centre, lines run on straight through crossings, and thick ink such as pupils is filled.
   - `edges`: clean outlines, from Canny edge detection.
   - `comic`: ink lines plus shading. The shading is drawn in one of four fill styles: `zigzag` (default, V-shaped scribble), `z-lines`, `serpentine` or classic `lines`.
-- **Up to 4 pen colours** (black, green, red, blue). Each stroke gets the pen that matches the image underneath it, and one script is written per colour.
+- **Up to 4 pen colours** (black, green, red, blue). Each stroke gets the matching pen, and one script is written per colour. In line art, each line keeps the colour it was drawn in.
+- **Optional AI restyle, with two models to choose from.** Both need an NVIDIA GPU.
+  - **FLUX.1 Kontext**, 4-bit via [Nunchaku](https://github.com/nunchaku-tech/nunchaku). This gives the best results. It redraws the photo as a clean line drawing from a text instruction, in colour if you ask for it.
+  - **Stable Diffusion 1.5 + lineart ControlNet**. It is faster, about 2 s per image, and redraws the image as a comic.
 - **Tk GUI**:
+  - Shows the source, the AI-styled source and the robot drawing side by side.
   - Drag and drop an image, and every setting updates the preview live.
   - The estimated drawing time is shown per pen.
   - Live webcam mode, refreshed every few seconds.
-  - One-click save of the image, preview and scripts.
-- **Optional AI restyle**: Stable Diffusion 1.5 image-to-image with a lineart ControlNet redraws the image as a comic before it is turned into strokes. Needs an NVIDIA GPU.
+  - One-click save of the image, AI image, preview and scripts.
 - **Previews**: a preview PNG is written for every result, so you can check it before the robot moves.
 
 ## Requirements
 
 - [uv](https://docs.astral.sh/uv/). Each script declares its own dependencies, so `uv run` installs everything automatically. No manual `pip install` is needed.
 - A UR robot with PolyScope and a pen mounted on the tool flange.
-- Optional, for AI restyle: an NVIDIA GPU with about 6 GB or more of VRAM, plus about 3.5 GB of disk for the model weights.
+- Optional, for AI restyle:
+  - **FLUX.1 Kontext**:
+    - an NVIDIA GPU with at least 12 GB of VRAM, plus about 10 GB of disk for the model weights
+    - a free [Hugging Face](https://huggingface.co) account (see [AI colour line drawing](#ai-colour-line-drawing-best-result))
+  - **Stable Diffusion 1.5**: about 6 GB or more of VRAM, plus about 3.5 GB of disk.
 
-Tested on Windows 11 with an RTX 5070 Laptop GPU.
+Tested on Windows 11 with an RTX 4060 Ti 16 GB (Kontext: about 30–40 s per image at 1024 px) and an RTX 5070 Laptop GPU (SD 1.5).
 
 ## Quick start
 
@@ -40,6 +60,28 @@ uv run src/robot_painter_gui.py
 
 Drop an image onto the window, choose a style and the pens, check the preview, then press **Save** (Ctrl+S). The files are written to `output/`.
 
+### AI colour line drawing (best result)
+
+1. **One-time setup.** Accept the FLUX.1 Kontext licence on its [Hugging Face page](https://huggingface.co/black-forest-labs/FLUX.1-Kontext-dev), then log in once:
+   ```
+   uvx hf auth login
+   ```
+   The first start downloads about 10 GB of weights, which takes a few minutes.
+2. **Choose the model.** In the GUI, open the **AI** tab, tick **AI restyle before drawing** and choose **FLUX.1 Kontext (Nunchaku 4-bit)** as the model. The style switches to **Line art** automatically, and the Edges, Comic and Fill settings are disabled.
+3. **Choose the pens** you want to use.
+4. **Write an instruction that names a colour for each object.** Kontext ignores a plain list like "use black, green, red and blue". It does draw coloured lines when each colour is tied to an object. The colour Mona Lisa above was made with:
+   > Make a coloring-book line art of this painting using coloured outlines only: blue outlines for the sky and the river, green outlines for the hills, trees and landscape, red outlines for the lips, black outlines for the woman, her face, hair and dress. White background, no fill, no shading.
+
+   Name the objects in your own picture, for example "red outlines on the tulips, green outlines on the leaves and stems, black outlines everywhere else". Generic wording such as "outline red objects in red" tends to produce coloured *fills* instead of lines. For a single black pen, the default instruction is enough.
+5. **Check the preview** in the right-hand panel, then **Save**.
+
+The **Line art** tab fine-tunes the tracing. **Ink darker than** drops faint lines, and **Pen width** sets both the fill spacing and the preview line width. **Colours from** is set to *drawing* by default, so each line uses its own colour; *photo* takes the colour of the original photo under each line instead.
+
+The Kontext worker can also be run on its own:
+```
+uv run src/kontext_worker.py --selftest images/monalisa.png        # writes images/monalisa_kontext.png
+```
+
 **Command line**
 
 ```
@@ -52,6 +94,9 @@ uv run src/image_to_urscript.py images/monalisa.png --style comic
 # comic style with four pens  ->  monalisa_black.script, monalisa_red.script, ...
 uv run src/image_to_urscript.py images/monalisa.png --style comic --colours black,green,red,blue
 
+# trace an (AI) line drawing, keeping its line colours  ->  one script per pen
+uv run src/image_to_urscript.py images/monalisa_kontext_colour.png --style lineart --colours black,green,red,blue
+
 # custom output name and drawing width (mm)
 uv run src/image_to_urscript.py photo.jpg -o photo.script --width 120
 ```
@@ -61,8 +106,9 @@ uv run src/image_to_urscript.py photo.jpg -o photo.script --width 120
 | `image` | Input image (PNG, JPG, …) |
 | `-o, --output` | Output `.script` path (default: next to the image) |
 | `--width` | Drawing width in mm (default 150; height follows the aspect ratio, max 200) |
-| `--style` | `edges` (default) or `comic` |
+| `--style` | `edges` (default), `comic` or `lineart` |
 | `--colours` | Comma-separated pens. Writes one `<name>_<colour>.script` per pen that has strokes |
+| `--colour-from` | (`lineart`) Take line colours from this photo instead of from the drawing |
 
 All other settings are constants at the top of [`src/image_to_urscript.py`](src/image_to_urscript.py), and every one of them is also available in the GUI. They cover canvas size and offset, pen up/down height, tool orientation, speeds, blend radius, edge and ink thresholds, tone levels, fill style and layers, and colour matching.
 
@@ -89,6 +135,13 @@ The time estimate is a lower bound: it ignores acceleration and pen changes.
 image ──► (optional AI restyle) ──► strokes in pixels ──► colour split ──► mm + simplify ──► ordering ──► URScript per pen
 ```
 
+- **lineart style.** Made for line drawings such as the Kontext output. It works at a higher resolution (1200 px) so that fine, close-together lines stay apart.
+  1. Pixels darker than the ink threshold become ink, without small specks.
+  2. Zhang–Suen thinning reduces every line to its 1-pixel centre line. The small L-shaped "staircase" steps that thinning leaves behind are removed, so they don't look like junctions, and short side spurs are pruned.
+  3. The centre lines are cut at real junctions into chains. At every junction the chain ends are paired up by how straight they continue, so a line crossing or touching another one runs on as a single stroke.
+  4. Strokes are smoothed so they don't follow the pixel staircase, then simplified to 0.1 mm.
+  5. Ink wider than about two pen widths (pupils, bold lashes, eyebrows) is filled with nested outlines one pen width apart.
+  6. **Colours.** Each ink pixel keeps the pen closest to its own colour, and the pale anti-aliased edge of a line follows the line's core. A line is only split where its colour really changes, not where it crosses a line of another colour.
 - **edges style.** Blur, then Canny, then trace the 1-pixel edges into open polylines.
 - **comic style.**
   1. Equalise the contrast and flatten the image with an edge-preserving filter.
@@ -112,7 +165,12 @@ image ──► (optional AI restyle) ──► strokes in pixels ──► colo
   - **Paper.** White paper takes the colour of the nearest inked area, so outlines are drawn in the object's colour.
   - **Splitting.** Lines are cut where the pen colour changes.
 - **Back end.** Convert to mm in the feature frame (image Y up), simplify with Douglas–Peucker, drop very short strokes, then order the strokes nearest-neighbour to reduce pen-up travel.
-- **AI restyle.** [`src/diffusion_worker.py`](src/diffusion_worker.py) runs as a separate process with its own PyTorch environment, so the GUI stays lightweight.
+- **AI restyle.** Each model runs as a separate worker process with its own PyTorch environment, so the GUI stays lightweight. Only one worker runs at a time, and the GUI caches the AI image, so changing drawing settings doesn't re-run the model.
+- **FLUX.1 Kontext worker** ([`src/kontext_worker.py`](src/kontext_worker.py)).
+  - **Model.** FLUX.1 Kontext [dev], an instruction-following image editor. The transformer and the T5 text encoder are 4-bit quantised with Nunchaku: INT4 on RTX 20/30/40 cards, FP4 on RTX 50 cards.
+  - **Alignment.** The output has exactly the input size, so the drawing lines up with the photo.
+  - **Tuning.** In the **AI** tab you can set the instruction, size, steps, guidance and seed.
+- **Stable Diffusion worker** ([`src/diffusion_worker.py`](src/diffusion_worker.py)).
   - **Models.** It uses Stable Diffusion 1.5 (`stable-diffusion-v1-5/stable-diffusion-v1-5`) with a lineart ControlNet (`lllyasviel/control_v11p_sd15_lineart`).
   - **First use.** The models download to the Hugging Face cache (about 3.5 GB), which takes a few minutes.
   - **Speed.** After that, one image takes about 2 s on an RTX 5070 Laptop GPU.
@@ -125,7 +183,8 @@ image ──► (optional AI restyle) ──► strokes in pixels ──► colo
 src/
   image_to_urscript.py   image → strokes → URScript (CLI + core library)
   robot_painter_gui.py   Tk GUI: drag & drop, live preview, webcam, save
-  diffusion_worker.py    optional AI restyle worker (Stable Diffusion + ControlNet)
+  kontext_worker.py      optional AI worker: FLUX.1 Kontext, 4-bit via Nunchaku (best)
+  diffusion_worker.py    optional AI worker: Stable Diffusion 1.5 + lineart ControlNet
 urscript/
   URScript.script        hand-written 100 mm square test program
 images/                  input images
@@ -133,7 +192,9 @@ examples/                generated sample output
   edges/                 outline style, one pen
   comic/                 comic style, one pen
   colour/                comic style, colour pens (+ colour map)
-  ai/                    AI-restyled source → comic style, colour pens
+  ai/                    SD 1.5-restyled source → comic style, colour pens
+  lineart/               Kontext line drawing → line art, one pen
+  lineart_colour/        Kontext colour line drawing → line art, four pens
 output/                  GUI save folder (not committed)
 ```
 
@@ -144,4 +205,9 @@ output/                  GUI save folder (not committed)
 
 ## License
 
-[MIT](LICENSE). The AI models downloaded at runtime have their own licences: Stable Diffusion 1.5 is under CreativeML OpenRAIL-M, and the ControlNet is under its own licence on Hugging Face.
+[MIT](LICENSE). The AI models downloaded at runtime have their own licences:
+- FLUX.1 Kontext [dev] is under the FLUX.1 [dev] **non-commercial** licence.
+- Stable Diffusion 1.5 is under CreativeML OpenRAIL-M.
+- The ControlNet and the Nunchaku weights are under their own licences on Hugging Face.
+
+The AI-generated sample images in `images/` were made with FLUX.1 Kontext [dev].
