@@ -17,6 +17,7 @@ Tk GUI for image_to_urscript.py.
 """
 
 import base64
+import dataclasses
 import json
 import os
 import queue
@@ -34,6 +35,9 @@ import cv2
 import numpy as np
 
 import image_to_urscript as core
+import ur_remote
+
+ONLINE_SETTINGS = Path.home() / ".robot_painter_online.json"  # robot IP, port, canvas pose
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -124,6 +128,11 @@ STYLE_TABS = {"Edges", "Comic", "Fill"}
 
 MAX_HATCH_LAYERS = 4
 EXTRA_HATCH_DEFAULTS = [(0, 3.0, 0), (90, 3.0, 0)]  # offered as disabled extra layers
+
+
+def fmt_duration(seconds: float) -> str:
+    mins, secs = divmod(int(seconds), 60)
+    return f"{mins} min {secs:02d} s"
 
 
 def to_photo(img: np.ndarray, max_w: int, max_h: int) -> tk.PhotoImage:
@@ -383,6 +392,7 @@ class App:
             if tab == "Fill":
                 self._build_hatch_layers(frame, len(specs))
         self._build_ai_tab(nb)
+        self._build_online_tab(nb)
 
         cam = ttk.LabelFrame(left, text="Webcam", padding=6)
         cam.pack(fill="x")
@@ -520,6 +530,213 @@ class App:
             except tk.TclError:
                 params[key] = AI_ENGINES[engine]["defaults"][key]
         return params
+
+    # ------------------------------------------------------------- online robot
+    def _build_online_tab(self, nb):
+        """Send the current drawing straight to the robot over TCP/IP (see ur_remote.py)."""
+        frame = ttk.Frame(nb, padding=6)
+        nb.add(frame, text="Online")
+        frame.columnconfigure(1, weight=1)
+        try:
+            saved = json.loads(ONLINE_SETTINGS.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            saved = {}
+        self.robot_ip = tk.StringVar(value=saved.get("ip", "192.168.0.10"))
+        self.robot_port = tk.IntVar(value=saved.get("port", ur_remote.DEFAULT_PORT))
+        self.canvas_pose = tk.StringVar(value=saved.get("canvas_pose", ""))
+        self.online_pen = tk.StringVar()
+        self.online_speed = tk.IntVar(value=saved.get("speed", 100))
+        self.online_events = queue.Queue()
+        self.online_run = None  # (start time, estimated seconds, pen) while the robot draws
+
+        ttk.Label(frame, text="Robot IP").grid(row=0, column=0, sticky="w")
+        addr = ttk.Frame(frame)
+        addr.grid(row=0, column=1, sticky="ew", pady=1)
+        ttk.Entry(addr, textvariable=self.robot_ip, width=15).pack(side="left", fill="x", expand=True)
+        ttk.Label(addr, text="Port").pack(side="left", padx=(6, 2))
+        ttk.Spinbox(addr, from_=1, to=65535, textvariable=self.robot_port, width=6).pack(side="left")
+        ttk.Label(frame, text="Canvas pose").grid(row=1, column=0, sticky="w")
+        ttk.Entry(frame, textvariable=self.canvas_pose).grid(row=1, column=1, sticky="ew", pady=1)
+        ttk.Label(frame, text='Feature1 in base frame, p[x,y,z,rx,ry,rz] m/rad\n'
+                              '(the "Feature Pose:" log line of a .script run)',
+                  foreground="#666").grid(row=2, column=0, columnspan=2, sticky="w")
+
+        ttk.Label(frame, text="Pen").grid(row=5, column=0, sticky="w", pady=(6, 0))
+        self.online_pen_cb = ttk.Combobox(frame, textvariable=self.online_pen, state="readonly", width=10)
+        self.online_pen_cb.grid(row=5, column=1, sticky="w", pady=(6, 0))
+        self.online_pen_cb.bind("<<ComboboxSelected>>", lambda e: self.update_online_tab())
+        ttk.Label(frame, text="Speed").grid(row=6, column=0, sticky="w")
+        ttk.Scale(frame, from_=10, to=200, variable=self.online_speed, orient="horizontal",
+                  command=self.on_online_speed).grid(row=6, column=1, sticky="ew")
+        self.online_speed_label = ttk.Label(frame, text="", foreground="#555")
+        self.online_speed_label.grid(row=7, column=0, columnspan=2, sticky="w")
+
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=8, column=0, columnspan=2, sticky="w", pady=(6, 4))
+        tk.Button(buttons, text="▶  Start drawing", bg="#2e7d32", fg="white", width=14,
+                  command=self.online_start).pack(side="left")
+        tk.Button(buttons, text="■  Stop", bg="#c62828", fg="white", width=9,
+                  command=self.online_stop).pack(side="left", padx=6)
+        self.online_progress = ttk.Progressbar(frame, maximum=1.0)
+        self.online_progress.grid(row=9, column=0, columnspan=2, sticky="ew")
+        self.online_status = ttk.Label(frame, text="Not sent yet", foreground="#555", wraplength=290)
+        self.online_status.grid(row=10, column=0, columnspan=2, sticky="w", pady=(2, 4))
+        self.online_preview = tk.Label(frame, bg="white", text="Load an image first", fg="#777")
+        self.online_preview.grid(row=11, column=0, columnspan=2, sticky="nw")
+
+    def on_online_speed(self, value):
+        snapped = int(round(float(value) / 5) * 5)  # 5 % steps
+        if self.online_speed.get() != snapped:
+            self.online_speed.set(snapped)
+        self.update_online_speed_label()
+
+    def online_plan(self):
+        """(result, pen, strokes) of the drawing currently on screen, or None."""
+        if not self.job:
+            return None
+        result = self.job[2]
+        pen = self.online_pen.get()
+        return result, pen, result.layers.get(pen, [])
+
+    def update_online_speed_label(self):
+        factor = self.online_speed.get() / 100
+        text = (f"{self.online_speed.get()} %: draw {core.DRAW_SPEED * factor * 1000:.0f} mm/s, "
+                f"travel {core.TRAVEL_SPEED * factor * 1000:.0f} mm/s")
+        plan = self.online_plan()
+        if plan and plan[2]:
+            text += f"\n{len(plan[2])} strokes, ~{fmt_duration(plan[0].est_times[plan[1]] / factor)}"
+        self.online_speed_label.configure(text=text)
+
+    def update_online_tab(self):
+        """Pen list, speed/time text and the picture to be drawn, for the job on screen."""
+        if not self.job:
+            return
+        result = self.job[2]
+        pens = [c for c, strokes in result.layers.items() if strokes]
+        self.online_pen_cb.configure(values=pens)
+        if self.online_pen.get() not in pens:
+            self.online_pen.set(pens[0] if pens else "")
+        self.update_online_speed_label()
+        # the selected pen in colour, the other pens faint for context
+        px_per_mm = 290 / (result.width_mm + abs(core.OFFSET_X_MM) + 2)
+        full = core.render_preview(result, px_per_mm).astype(np.float32)
+        pen = self.online_pen.get()
+        only = dataclasses.replace(result, layers={c: (s if c == pen else []) for c, s in result.layers.items()})
+        selected = core.render_preview(only, px_per_mm).astype(np.float32)
+        img = np.minimum(255 - (255 - full) * 0.18, selected).astype(np.uint8)
+        photo = to_photo(img, 290, 150)  # small enough that the tab keeps Webcam/Save on screen
+        self.online_preview.configure(image=photo, text="")
+        self.online_preview.image = photo
+
+    def save_online_settings(self):
+        try:
+            ONLINE_SETTINGS.write_text(json.dumps({
+                "ip": self.robot_ip.get().strip(), "port": self.robot_port.get(),
+                "canvas_pose": self.canvas_pose.get().strip(), "speed": self.online_speed.get(),
+            }, indent=2), encoding="utf-8")
+        except (OSError, tk.TclError):
+            pass  # only a convenience
+
+    def robot_address(self):
+        host = self.robot_ip.get().strip()
+        try:
+            port = int(self.robot_port.get())
+        except (tk.TclError, ValueError):
+            port = 0
+        if not host or not 0 < port < 65536:
+            raise ValueError("Enter the robot's IP address and port")
+        return host, port
+
+    def online_start(self):
+        plan = self.online_plan()
+        if not plan or not plan[2]:
+            messagebox.showinfo("Robot Painter", "Nothing to draw - load an image and choose a pen.")
+            return
+        result, pen, strokes = plan
+        try:
+            host, port = self.robot_address()
+            pose = ur_remote.parse_pose(self.canvas_pose.get())
+        except ValueError as e:
+            messagebox.showerror("Robot Painter", str(e))
+            return
+        if not self.busy:
+            self.apply_settings()  # current Robot tab values (orientation, pen heights, speeds)
+        factor = self.online_speed.get() / 100
+        est = result.est_times[pen] / factor
+        if not messagebox.askokcancel(
+                "Start drawing",
+                f"The robot at {host}:{port} will start moving now.\n\n"
+                f"Pen: {pen}   ({len(strokes)} strokes, ~{fmt_duration(est)})\n"
+                f"Speed: {self.online_speed.get()} %\n"
+                f"Canvas: {ur_remote.pose_text(pose)}\n\n"
+                f"Fit the {pen} pen and make sure the workspace is clear.",
+                icon="warning"):
+            return
+        text = ur_remote.program_text(result, pen, pose, factor)
+        self.save_online_settings()
+        self.online_status.configure(text=f"Sending to {host}:{port}…", foreground="#555")
+
+        def work():
+            try:
+                ur_remote.send_script(host, port, text)
+                self.online_events.put(("started", (pen, est, text.count("\n"))))
+            except OSError as e:
+                self.online_events.put(("error", f"Could not send to {host}:{port}: {e}"))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def online_stop(self):
+        try:
+            host, port = self.robot_address()
+        except ValueError as e:
+            messagebox.showerror("Robot Painter", str(e))
+            return
+        try:
+            pose = ur_remote.parse_pose(self.canvas_pose.get())
+        except ValueError:
+            pose = None  # still stop, just without lifting the pen
+        text = ur_remote.stop_program_text(pose)
+        self.online_status.configure(text=f"Stopping ({host}:{port})…", foreground="#555")
+
+        def work():
+            try:
+                ur_remote.send_script(host, port, text)
+                self.online_events.put(("stopped", None))
+            except OSError as e:
+                self.online_events.put(("error", f"Could not send Stop to {host}:{port}: {e}"))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def poll_online(self):
+        """Called from poll_results: send results and the (time-based) drawing progress."""
+        try:
+            while True:
+                kind, payload = self.online_events.get_nowait()
+                if kind == "started":
+                    pen, est, n_lines = payload
+                    self.online_run = (time.monotonic(), est, pen)
+                    self.save_online_settings()
+                elif kind == "stopped":
+                    self.online_run = None
+                    self.online_progress.configure(value=0)
+                    self.online_status.configure(text=f"Stop sent {datetime.now():%H:%M:%S}: "
+                                                      "robot stopped, pen lifted", foreground="#555")
+                else:
+                    self.online_run = None
+                    self.online_status.configure(text=payload, foreground="#c62828")
+        except queue.Empty:
+            pass
+        if self.online_run:
+            t0, est, pen = self.online_run
+            done = time.monotonic() - t0
+            self.online_progress.configure(value=min(done / max(est, 1), 1.0))
+            if done < est:
+                text = (f"Drawing {pen}: ~{fmt_duration(est - done)} left\n"
+                        "(estimate)")
+            else:
+                text = f"Drawing {pen}: estimated time reached - check the robot"
+            if self.online_status.cget("text") != text:
+                self.online_status.configure(text=text, foreground="#2e7d32")
 
     def update_ai_status(self):
         if not self.ai_enabled.get():
@@ -808,6 +1025,7 @@ class App:
         if self.waiting_for_ai and (self.ai is None or self.ai.state != "starting"):
             self.waiting_for_ai = False
             self.start_job()
+        self.poll_online()
         if not self.closed:
             self.root.after(100, self.poll_results)
 
@@ -859,6 +1077,7 @@ class App:
             text = (f"{colour:<6}{len(strokes):4d} strokes ~{fmt(result.est_times[colour])}"
                     if colour in scripts else f"{colour:<6}   – no script")
             ttk.Label(self.colour_rows, text=text, font=("Consolas", 11)).grid(row=i, column=1, sticky="w")
+        self.update_online_tab()
 
     def on_resize(self, _event):
         if self._resize:

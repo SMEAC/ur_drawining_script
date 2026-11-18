@@ -33,8 +33,8 @@ end
 
 def pen_up():
   pose = get_actual_tcp_pose()
-  local = pose_trans(pose_inv(myFeature), pose)
-  movel(pose_trans(myFeature, p[local[0], local[1], z_up, rx, ry, rz]), a=acc, v=travel_v)
+  here = pose_trans(pose_inv(myFeature), pose)
+  movel(pose_trans(myFeature, p[here[0], here[1], z_up, rx, ry, rz]), a=acc, v=travel_v)
 end
 
 # stroke 1/371

@@ -106,7 +106,19 @@ The AI tab has a **Model** dropdown (`AI_ENGINES` in the GUI). Each engine has i
 
 The preview PNG is large (~1000 px). Hatching aliases badly when it is viewed scaled down, so crop it before judging the hatch layers.
 
-The generated script defines `pen_to`, `line_to` and `pen_up` helpers and emits one call per point. Blend radii are capped at 0.45× the adjacent segment lengths, because UR rejects overlapping blends.
+The generated script defines `pen_to`, `line_to` and `pen_up` helpers and emits one call per point. Blend radii are capped at 0.45× the adjacent segment lengths, because UR rejects overlapping blends. Don't name a variable `local` (or `global`): both are URScript keywords. `pen_up` once used `local` and now uses `here`.
+
+### Online mode (`ur_remote.py`, GUI "Online" tab)
+
+This sends the drawing to the robot over TCP/IP, following the "Sending Multiple Line Scripts" example of the UR forum guide (forum.universal-robots.com/t/32973).
+
+- **Program**: one `def robot_painter(): … end` program per pen is sent as text plus `\n` to port 30001 (or 30002). The controller runs it immediately. `program_text()` declares its settings with `global` and uses short helpers `P`/`L`/`U` to keep thousands of points compact: the black pen of `lineart_colour` is about 150 KB.
+- **No `Feature1`**: a script sent over the socket runs outside PolyScope's generated program, so installation features are undefined. The canvas pose (Feature1 in the base frame) is written into the program as a literal. The user copies it from the `Feature Pose:` textmsg of a `.script` run.
+- **Stop**: sends `robot_painter_stop()`, which replaces the running program, calls `stopl` and lifts the pen if the pose is known.
+- **Speed slider**: scales `DRAW_SPEED` and `TRAVEL_SPEED`, and only applies on the next Start. Progress is time-based, from the estimate; there is no feedback from the robot.
+- **Settings**: IP, port, pose and speed are saved to `~/.robot_painter_online.json`.
+- **Remote mode**: e-Series robots accept external scripts only in Remote Control mode.
+- **Testing**: no robot or URSim is available here. Test against a local fake TCP server that records what it receives (the GUI's `robot_ip`/`robot_port`), and check the `def`/`end` balance.
 
 ## URScript conventions used
 

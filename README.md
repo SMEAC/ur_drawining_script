@@ -34,6 +34,7 @@ That gives 953 strokes, 534 black, 222 blue, 124 green and 73 red, and about 10 
   - The estimated drawing time is shown per pen.
   - Live webcam mode, refreshed every few seconds.
   - One-click save of the image, AI image, preview and scripts.
+  - **Online** tab: send the drawing straight to the robot over TCP/IP, with Start, Stop and a speed slider (see [Online](#online-send-the-drawing-straight-to-the-robot)).
 - **Previews**: a preview PNG is written for every result, so you can check it before the robot moves.
 
 ## Requirements
@@ -129,6 +130,25 @@ Each program defines small helpers (`pen_to`, `line_to`, `pen_up`) and then make
 
 The time estimate is a lower bound: it ignores acceleration and pen changes.
 
+### Online: send the drawing straight to the robot
+
+The GUI's **Online** tab sends the drawing directly to the robot over TCP/IP, so no `.script` files have to be copied to the pendant. It follows the "Sending Multiple Line Scripts" example of the Universal Robots guide [UR remote control via TCP/IP](https://forum.universal-robots.com/t/guide-and-example-ur-remote-control-via-tcpip/32973). One complete `def … end` program per pen is sent to the robot's primary interface (port 30001, or 30002), and the controller runs it immediately.
+
+1. **Robot.**
+   - **Network.** Connect the PC and the robot to the same network.
+   - **Remote mode (e-Series).** e-Series robots only accept scripts from outside in **Remote Control** mode. Enable it under *Settings → System → Remote Control*, then switch the pendant to *Remote*.
+2. **Address.** Enter the robot's **IP address** and **port**.
+3. **Canvas pose.**
+   - **Why it's needed.** A program sent this way runs outside PolyScope's generated program, so the installation feature `Feature1` is not available. Enter the canvas pose instead: `Feature1` in the robot base frame, as `p[x, y, z, rx, ry, rz]` in metres and radians.
+   - **Where to find it.** Every `.script` file logs this pose as `Feature Pose: p[…]` when it runs on the robot. Copy it from the pendant log once.
+   - **Saved.** The IP address, port and pose are remembered between sessions.
+4. **Pen and speed.** Choose the **pen** to draw (one pen at a time) and set the **speed** (10–200 % of the draw and travel speeds from the Robot tab). The tab shows the strokes of that pen and the estimated time.
+5. **Start.** Press **Start drawing** and confirm. The program is sent and the robot starts straight away. A progress bar follows the estimated time.
+6. **Stop.** **Stop** sends a short stop program. It replaces the running one, decelerates the robot and lifts the pen.
+7. **Next pen.** For the next colour, change the pen, select it in the tab and press Start again.
+
+The program is built by [`src/ur_remote.py`](src/ur_remote.py). It uses the same moves, blends, tool orientation and pen heights as the `.script` files.
+
 ## How it works
 
 ```
@@ -185,6 +205,7 @@ src/
   robot_painter_gui.py   Tk GUI: drag & drop, live preview, webcam, save
   kontext_worker.py      optional AI worker: FLUX.1 Kontext, 4-bit via Nunchaku (best)
   diffusion_worker.py    optional AI worker: Stable Diffusion 1.5 + lineart ControlNet
+  ur_remote.py           online mode: build one program per pen and send it to the robot over TCP/IP
 urscript/
   URScript.script        hand-written 100 mm square test program
 images/                  input images
