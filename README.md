@@ -34,7 +34,7 @@ That gives 953 strokes, 534 black, 222 blue, 124 green and 73 red, and about 10 
   - The estimated drawing time is shown per pen.
   - Live webcam mode, refreshed every few seconds.
   - One-click save of the image, AI image, preview and scripts.
-  - **Online** tab: send the drawing straight to the robot over TCP/IP, with Start, Stop and a speed slider (see [Online](#online-send-the-drawing-straight-to-the-robot)).
+  - **Online** tab: send the drawing straight to the robot over TCP/IP, with a connection test, jog buttons, Start, Stop and a speed slider (see [Online](#online-send-the-drawing-straight-to-the-robot)).
 - **Previews**: a preview PNG is written for every result, so you can check it before the robot moves.
 
 ## Requirements
@@ -43,11 +43,12 @@ That gives 953 strokes, 534 black, 222 blue, 124 green and 73 red, and about 10 
 - A UR robot with PolyScope and a pen mounted on the tool flange.
 - Optional, for AI restyle:
   - **FLUX.1 Kontext**:
-    - an NVIDIA GPU with at least 12 GB of VRAM, plus about 10 GB of disk for the model weights
+    - an NVIDIA GPU with 8 GB of VRAM or more, plus about 20 GB of disk for the model weights. Below 12 GB the worker switches to a low-memory mode automatically, which keeps the model in system RAM (16 GB or more recommended) and streams layers to the GPU.
     - a free [Hugging Face](https://huggingface.co) account (see [AI colour line drawing](#ai-colour-line-drawing-best-result))
+    - On Windows 11 with **Smart App Control** switched on, Nunchaku's compiled module is blocked ("An Application Control policy has blocked this file"), and Kontext can't run.
   - **Stable Diffusion 1.5**: about 6 GB or more of VRAM, plus about 3.5 GB of disk.
 
-Tested on Windows 11 with an RTX 4060 Ti 16 GB (Kontext: about 30–40 s per image at 1024 px) and an RTX 5070 Laptop GPU (SD 1.5).
+Tested on Windows 11 with an RTX 4060 Ti 16 GB (Kontext: about 30–40 s per image at 1024 px) and an RTX 5070 Laptop GPU 8 GB (Kontext in low-memory mode: about 40 s per image at 1024 px; SD 1.5: about 2 s).
 
 ## Quick start
 
@@ -140,12 +141,21 @@ The GUI's **Online** tab sends the drawing directly to the robot over TCP/IP, so
 2. **Address.** Enter the robot's **IP address** and **port**.
 3. **Canvas pose.**
    - **Why it's needed.** A program sent this way runs outside PolyScope's generated program, so the installation feature `Feature1` is not available. Enter the canvas pose instead: `Feature1` in the robot base frame, as `p[x, y, z, rx, ry, rz]` in metres and radians.
-   - **Where to find it.** Every `.script` file logs this pose as `Feature Pose: p[…]` when it runs on the robot. Copy it from the pendant log once.
-   - **Saved.** The IP address, port and pose are remembered between sessions.
-4. **Pen and speed.** Choose the **pen** to draw (one pen at a time) and set the **speed** (10–200 % of the draw and travel speeds from the Robot tab). The tab shows the strokes of that pen and the estimated time.
-5. **Start.** Press **Start drawing** and confirm. The program is sent and the robot starts straight away. A progress bar follows the estimated time.
-6. **Stop.** **Stop** sends a short stop program. It replaces the running one, decelerates the robot and lifts the pen.
-7. **Next pen.** For the next colour, change the pen, select it in the tab and press Start again.
+   - **Where to find it.** `Feature1` only exists inside PolyScope, so its pose can't be read from the PC. Run [`urscript/print_feature_pose.script`](urscript/print_feature_pose.script) once in a PolyScope Script node. It doesn't move the robot; it logs `Feature Pose: p[…]` and shows the value in a popup. Every generated `.script` file logs the same line when it runs.
+   - **Saved.** The IP address, port, pose and the drawing orientation are remembered between sessions.
+4. **Test the robot.** Before the first drawing, check the link in the **Test the robot** panel:
+   - **Test connection** connects without moving anything and reports whether the controller answers.
+   - **Go to canvas origin +10 mm.** After a confirmation, the tool moves in a straight line (50 mm/s) to 10 mm above the canvas origin (`Feature1` 0,0,0), on the pen-up side and with the drawing's tool orientation. If the canvas pose, the TCP and the orientation are right, the pencil tip stops just above the canvas corner, pointing the way it will draw.
+   - **Read position** sends nothing to the robot. It reads the tool (TCP) position from the robot's status data and shows it in base coordinates and, with a canvas pose entered, in canvas coordinates. It also shows how far the tool is from the "Go to canvas origin" target, and the angle between the tool and the drawing orientation. Use it to see by how much, and in which direction, the robot is off.
+   - **Use current tool orientation for drawing.** Position the pencil the way it should draw (e.g. with freedrive or the pendant), then press the button. It reads the tool's orientation relative to the canvas and, after a confirmation, sets Orientation RX/RY/RZ in the Robot tab to it. The robot doesn't move. The default (1.6, −1.4, −0.8) comes from the original test program and only fits the Feature1 it was tuned for; with a Feature1 taught along the tool axes the right values are about (0, 0, 0).
+   - **Log robot pose** writes the current tool (TCP) pose to the pendant's Log tab and shows it in a popup there, without moving. It also reads the same pose from the robot, shows it in the GUI and copies it to the clipboard. With a canvas pose entered, it also logs the tool position in canvas coordinates. Note that this is the *tool* pose, not `Feature1`.
+   - **Jog buttons** (+X, −X, +Y, −Y, +Z, −Z) move the tool in a straight line by the **Step** set on the slider (0.5–50 mm), slowly (20 mm/s) and without changing its orientation.
+   - **Axes.** With a canvas pose entered, the jog moves along the canvas axes, the same directions the drawing uses. That makes it a good check that X, Y and pen-up (+Z) point where you expect. Without a pose, the jog moves along the robot base axes.
+   - **While drawing.** Jogging is blocked while a drawing runs.
+5. **Pen and speed.** Choose the **pen** to draw (one pen at a time) and set the **speed** (10–200 % of the draw and travel speeds from the Robot tab). The tab shows the strokes of that pen and the estimated time.
+6. **Start.** Press **Start drawing** and confirm. The program is sent and the robot starts straight away. A progress bar follows the estimated time.
+7. **Stop.** **Stop** sends a short stop program. It replaces the running one, decelerates the robot and lifts the pen.
+8. **Next pen.** For the next colour, change the pen, select it in the tab and press Start again.
 
 The program is built by [`src/ur_remote.py`](src/ur_remote.py). It uses the same moves, blends, tool orientation and pen heights as the `.script` files.
 

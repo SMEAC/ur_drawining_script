@@ -1,0 +1,15 @@
+# Robot Painter: show the pose of Feature1 (the canvas) - the robot does NOT move.
+#
+# Load this into a Script node of a PolyScope program and run it once. It writes the
+# pose to the Log tab and shows it in a popup. Copy the p[...] value into the
+# "Canvas pose" field of the GUI's Online tab.
+#
+# Programs sent from the PC over TCP/IP run outside PolyScope's program, where
+# installation features such as Feature1 are not defined - that's why this has to run
+# inside PolyScope.
+
+textmsg("Feature Pose: ", Feature1)
+popup(str_cat("Feature1 in the base frame (m, rad) - copy this into the Online tab:<br>", Feature1), title="Robot Painter", blocking=True)
+
+# example IP 169.254.57.11
+# example return p[-0.578, -0.185, -0.32, -0.005, 0.0046, -0.83]

@@ -96,7 +96,12 @@ The AI tab has a **Model** dropdown (`AI_ENGINES` in the GUI). Each engine has i
 - **What it does**: FLUX.1 Kontext [dev] is an instruction-following image editor. It redraws the photo as line art from a text prompt and needs no control image.
 - **Same protocol**: it speaks the same protocol as `diffusion_worker.py` and reuses its `serve()`, `fit_size()` and I/O helpers.
 - **Environment**: Python 3.12, torch 2.9 from cu128, and the Nunchaku 1.2.1 wheel pinned by URL. The wheel tag must match the torch version.
-- **Precision**: `get_precision()` picks int4 (Ada, the RTX 4060 Ti 16 GB on this machine) or fp4 (Blackwell).
+- **Precision**: `get_precision()` picks int4 (Ada, e.g. the RTX 4060 Ti 16 GB) or fp4 (Blackwell, e.g. the RTX 5070 Laptop 8 GB).
+- **Low-memory mode** (GPUs < `LOW_VRAM_BELOW_GB` = 12, or `KONTEXT_LOW_VRAM=1`): the transformer loads with Nunchaku `offload=True`, the standard bf16 T5 from the Kontext repo replaces Nunchaku's 4-bit T5, and the pipeline uses `enable_sequential_cpu_offload()`. On the 8 GB RTX 5070 Laptop this peaks at about 2.6 GB VRAM and takes about 40 s per 1024 px image.
+  - **Why**: without it the whole pipeline (~10 GB) is put on the GPU. On Windows the NVIDIA driver then silently spills into shared system RAM instead of raising out-of-memory, and one image took about 50 minutes.
+  - A GGUF + plain-diffusers alternative was tried as well. It measured about 100 s per denoising step on 8 GB and was dropped.
+- **Smart App Control**: with it switched on (the laptop originally), Nunchaku's `_C` DLL is blocked and the worker fails at import. It only runs with Smart App Control off.
+- **Progress and timeout**: `generate()` logs `step i/n` to stderr, and the GUI shows the latest log line as "AI working…". `DiffusionClient.restyle` gives up after `AI_TIMEOUT_S` and kills the worker, because a late reply would otherwise be read as the answer to the next request. Engines flagged `"line_art": True` in `AI_ENGINES` lock the style.
 - **Weights**: about 9 GB of non-gated 4-bit transformer and T5 from `nunchaku-ai/`. CLIP, VAE and tokenizers come from the **gated** `black-forest-labs/FLUX.1-Kontext-dev`. Accept the licence on its Hugging Face page and run `uvx hf auth login` once. The licence is non-commercial.
 - **Self-test**: `uv run src/kontext_worker.py --selftest images/monalisa.png` writes `images/monalisa_kontext.png`.
 - **Output size**: the diffusers pipeline rescales its output to `max_area` (default 1 MP) while the input stays at the requested size. That offset the drawing against the photo, and made the Size setting useless. The worker therefore passes `max_area = h*w`.
@@ -115,8 +120,20 @@ This sends the drawing to the robot over TCP/IP, following the "Sending Multiple
 - **Program**: one `def robot_painter(): … end` program per pen is sent as text plus `\n` to port 30001 (or 30002). The controller runs it immediately. `program_text()` declares its settings with `global` and uses short helpers `P`/`L`/`U` to keep thousands of points compact: the black pen of `lineart_colour` is about 150 KB.
 - **No `Feature1`**: a script sent over the socket runs outside PolyScope's generated program, so installation features are undefined. The canvas pose (Feature1 in the base frame) is written into the program as a literal. The user copies it from the `Feature Pose:` textmsg of a `.script` run.
 - **Stop**: sends `robot_painter_stop()`, which replaces the running program, calls `stopl` and lifts the pen if the pose is known.
+- **Test the robot** panel:
+  - **Test connection** (`check_connection`): connects without sending anything. Ports 30001/30002 stream robot state on connect, so received bytes prove a UR controller answers.
+  - **Jog buttons** ±X/±Y/±Z send `jog_program_text`: a straight `movel` by the step (slider 0.5–50 mm, saved as `jog_step_mm`) at `JOG_SPEED` 20 mm/s, keeping the orientation.
+  - **Jog frame**: with a valid canvas pose the step is in the canvas frame, `target = feature * D * (feature^-1 * here)`; without one it's in the base frame (`pose_add`).
+  - Jogging is blocked while a drawing runs, because the jog program would replace it.
+  - **Go to canvas origin +10 mm** (`goto_origin_program_text`, `ORIGIN_CHECK_MM` in the GUI): one `movel` at `GOTO_SPEED` to `pose_trans(feature, p[0, 0, z, ORIENT_RX/RY/RZ])`, with z = `PEN_DOWN_Z_MM` + 10 mm towards the `PEN_UP_Z_MM` side. It needs a valid canvas pose and asks for confirmation first.
+  - **TCP**: the programs don't call `set_tcp`, so they use whatever TCP is active on the controller. That is normally the installation's default TCP (the pencil tip), but a PolyScope program that switched TCP leaves its TCP active.
+  - **Log robot pose**: `pose_log_program_text` writes the TCP pose to the pendant (textmsg + non-blocking popup, plus canvas-frame coordinates when a pose is set). The GUI then reads the same pose itself with `read_tcp_pose`, which parses the primary/secondary state stream: message type 16, sub-package 4 = Cartesian info, 6 big-endian doubles.
+  - **Read position**: reads with `read_tcp_pose` only; no program is sent. `describe_tcp` shows the TCP in the base frame and in the canvas frame (`inv(F) @ T`, using `pose_matrix`), its distance from the origin-check target, and the angle to the drawing orientation. Tested with a fake controller placed at a known offset.
+  - **Use current tool orientation for drawing** (`orientation_in_canvas`): the rotation vector of `inv(F) @ T`, written into the `ORIENT_RX/RY/RZ` GUI vars after a confirmation; nothing is sent to the robot.
+    - **Why**: `ORIENT_*` is relative to Feature1, so it depends on how Feature1 was taught. On the lab robot (Nov 2026) Feature1 matched the tool axes, so the correct values were about (0, 0, 0). The default (1.6, −1.4, −0.8) was 130° off, which made "Go to canvas origin" swing the tool away.
+  - **Feature1 can't be logged online**: socket programs run outside PolyScope, where it's undefined. `urscript/print_feature_pose.script` (a PolyScope Script node, no motion) logs it and shows it in a popup instead.
 - **Speed slider**: scales `DRAW_SPEED` and `TRAVEL_SPEED`, and only applies on the next Start. Progress is time-based, from the estimate; there is no feedback from the robot.
-- **Settings**: IP, port, pose and speed are saved to `~/.robot_painter_online.json`.
+- **Settings**: IP, port, pose, speed, jog step and the drawing orientation (`ORIENT_RX/RY/RZ`, robot-specific because it is relative to Feature1) are saved to `~/.robot_painter_online.json` and restored at start-up.
 - **Remote mode**: e-Series robots accept external scripts only in Remote Control mode.
 - **Testing**: no robot or URSim is available here. Test against a local fake TCP server that records what it receives (the GUI's `robot_ip`/`robot_port`), and check the `def`/`end` balance.
 

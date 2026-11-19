@@ -184,6 +184,9 @@ class Webcam:
 
 # AI restyle engines. Each runs its own worker script (same JSON-lines protocol).
 # "text": prompt fields, "numbers": (key, label, min, max, step, is_int) spinboxes.
+ORIGIN_CHECK_MM = 10  # "Go to canvas origin" stops this far above Feature1 0,0,0
+AI_TIMEOUT_S = 1200  # per image; a slow 8 GB GPU can need several minutes
+
 AI_ENGINES = {
     "sd15": {
         "label": "Stable Diffusion 1.5 + lineart ControlNet",
@@ -219,6 +222,7 @@ AI_ENGINES = {
                        "No shading, no hatching, no grey, no colour fill. Keep the faces and pose."),
             "size": 1024, "steps": 20, "guidance": 2.5, "seed": 42,
         },
+        "line_art": True,   # output is already a line drawing: lock the style to lineart
     },
 }
 AI_ENGINE_BY_LABEL = {e["label"]: key for key, e in AI_ENGINES.items()}
@@ -291,7 +295,16 @@ class DiffusionClient:
             core.save_image(src, bgr)
             self.proc.stdin.write(json.dumps({**params, "in": str(src), "out": str(dst)}) + "\n")
             self.proc.stdin.flush()
-            msg = self._replies.get(timeout=600)
+            try:
+                msg = self._replies.get(timeout=AI_TIMEOUT_S)
+            except queue.Empty:
+                # Stop the worker: a reply arriving later would otherwise be taken as the
+                # answer to the *next* request and show the wrong image.
+                self.proc.kill()
+                self.state = "failed"
+                self.error = (f"no result after {AI_TIMEOUT_S // 60} min - worker stopped. "
+                              "Likely out of GPU memory (Windows then spills into slow shared RAM).")
+                raise RuntimeError(self.error)
             src.unlink(missing_ok=True)
             if not msg.get("ok"):
                 raise RuntimeError(msg.get("error", "AI restyle failed"))
@@ -495,7 +508,8 @@ class App:
     def line_art_locked(self) -> bool:
         """Kontext already draws the line drawing, so the pipeline must only trace it.
         Released if its worker failed, since the plain photo is drawn instead then."""
-        return (self.ai_enabled.get() and self.selected_engine() == "kontext"
+        return (self.ai_enabled.get()
+                and AI_ENGINES[self.selected_engine()].get("line_art", False)
                 and not (self.ai and self.ai.state in ("failed", "stopped")))
 
     def sync_style_lock(self):
@@ -541,6 +555,10 @@ class App:
             saved = json.loads(ONLINE_SETTINGS.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             saved = {}
+        orientation = saved.get("orientation")
+        if isinstance(orientation, list) and len(orientation) == 3:
+            for k, v in zip(("ORIENT_RX", "ORIENT_RY", "ORIENT_RZ"), orientation):
+                self.vars[k].set(v)   # taught/edited orientation of this robot setup
         self.robot_ip = tk.StringVar(value=saved.get("ip", "192.168.0.10"))
         self.robot_port = tk.IntVar(value=saved.get("port", ur_remote.DEFAULT_PORT))
         self.canvas_pose = tk.StringVar(value=saved.get("canvas_pose", ""))
@@ -560,6 +578,7 @@ class App:
         ttk.Label(frame, text='Feature1 in base frame, p[x,y,z,rx,ry,rz] m/rad\n'
                               '(the "Feature Pose:" log line of a .script run)',
                   foreground="#666").grid(row=2, column=0, columnspan=2, sticky="w")
+        self._build_jog_panel(frame, row=3, saved=saved)
 
         ttk.Label(frame, text="Pen").grid(row=5, column=0, sticky="w", pady=(6, 0))
         self.online_pen_cb = ttk.Combobox(frame, textvariable=self.online_pen, state="readonly", width=10)
@@ -583,6 +602,264 @@ class App:
         self.online_status.grid(row=10, column=0, columnspan=2, sticky="w", pady=(2, 4))
         self.online_preview = tk.Label(frame, bg="white", text="Load an image first", fg="#777")
         self.online_preview.grid(row=11, column=0, columnspan=2, sticky="nw")
+
+    def _build_jog_panel(self, parent, row, saved):
+        """Connection test and six jog buttons, to check the robot link before drawing."""
+        box = ttk.LabelFrame(parent, text="Test the robot", padding=4)
+        box.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        box.columnconfigure(5, weight=1)
+        top = ttk.Frame(box)
+        top.grid(row=0, column=0, columnspan=6, sticky="w")
+        ttk.Button(top, text="Test connection", command=self.online_check).grid(row=0, column=0, sticky="w")
+        ttk.Button(top, text=f"Go to canvas origin +{ORIGIN_CHECK_MM:g} mm",
+                   command=self.online_goto_origin).grid(row=0, column=1, sticky="w", padx=4)
+        row2 = ttk.Frame(top)
+        row2.grid(row=1, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        ttk.Button(row2, text="Read position", command=self.online_read_position).pack(side="left")
+        ttk.Button(row2, text="Log robot pose", command=self.online_log_pose).pack(side="left", padx=4)
+        ttk.Label(row2, text="(no movement)", foreground="#666").pack(side="left")
+        ttk.Button(top, text="Use current tool orientation for drawing",
+                   command=self.online_use_orientation).grid(row=2, column=0, columnspan=2,
+                                                            sticky="w", pady=(2, 0))
+
+        # cross for X/Y, column for Z:      +Y          +Z
+        #                                -X    +X
+        #                                   -Y          -Z
+        jog = [("+Y", 1, 1, (0, 1, 0)), ("-X", 2, 0, (-1, 0, 0)), ("+X", 2, 2, (1, 0, 0)),
+               ("-Y", 3, 1, (0, -1, 0)), ("+Z", 1, 4, (0, 0, 1)), ("-Z", 3, 4, (0, 0, -1))]
+        for text, r, c, direction in jog:
+            ttk.Button(box, text=text, width=4,
+                       command=lambda d=direction: self.online_jog(d)).grid(row=r, column=c, padx=1, pady=1)
+        ttk.Label(box, text="").grid(row=1, column=3, padx=8)  # gap between XY cross and Z
+
+        self.jog_step = tk.DoubleVar(value=saved.get("jog_step_mm", 5.0))
+        step = ttk.Frame(box)
+        step.grid(row=4, column=0, columnspan=6, sticky="ew", pady=(4, 0))
+        ttk.Label(step, text="Step").pack(side="left")
+        ttk.Scale(step, from_=0.5, to=50, variable=self.jog_step, orient="horizontal", length=150,
+                  command=self.on_jog_step).pack(side="left", padx=4)
+        self.jog_step_label = ttk.Label(step, text="", width=8)
+        self.jog_step_label.pack(side="left")
+        self.jog_frame_label = ttk.Label(box, text="", foreground="#666", wraplength=280)
+        self.jog_frame_label.grid(row=5, column=0, columnspan=6, sticky="w")
+        self.position_label = tk.Label(box, text="", font=("Consolas", 8), justify="left",
+                                       anchor="w", bg="#f7f7f7")
+        self.position_label.grid(row=6, column=0, columnspan=6, sticky="ew", pady=(4, 0))
+        self.position_label.grid_remove()   # shown after the first "Read position"
+        self.canvas_pose.trace_add("write", lambda *_: self.update_jog_labels())
+        self.update_jog_labels()
+
+    def on_jog_step(self, value):
+        snapped = max(0.5, round(float(value) * 2) / 2)  # 0.5 mm steps
+        if self.jog_step.get() != snapped:
+            self.jog_step.set(snapped)
+        self.update_jog_labels()
+
+    def jog_frame_pose(self):
+        """Canvas pose if one is entered and valid, else None (= robot base frame)."""
+        try:
+            return ur_remote.parse_pose(self.canvas_pose.get())
+        except ValueError:
+            return None
+
+    def update_jog_labels(self):
+        self.jog_step_label.configure(text=f"{self.jog_step.get():g} mm")
+        if self.jog_frame_pose() is None:
+            text = "Moves along the robot BASE axes (no canvas pose)"
+        else:
+            text = "Moves along the CANVAS axes (Feature1)"
+        self.jog_frame_label.configure(
+            text=f"{text}, {ur_remote.JOG_SPEED * 1000:.0f} mm/s per press.")
+
+    def online_check(self):
+        try:
+            host, port = self.robot_address()
+        except ValueError as e:
+            messagebox.showerror("Robot Painter", str(e))
+            return
+        self.online_status.configure(text=f"Connecting to {host}:{port}…", foreground="#555")
+
+        def work():
+            try:
+                n = ur_remote.check_connection(host, port)
+                if n:
+                    msg = f"Connected to {host}:{port}: controller answers ({n} bytes of robot state)."
+                else:
+                    msg = (f"Connected to {host}:{port}, but no data received - is this a UR "
+                           "controller port (30001/30002)?")
+                self.online_events.put(("info", msg))
+            except OSError as e:
+                self.online_events.put(("error", f"No connection to {host}:{port}: {e}"))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def online_goto_origin(self):
+        """Move to ORIGIN_CHECK_MM above the canvas origin, to check the canvas pose by eye."""
+        if self.online_run:
+            messagebox.showinfo("Robot Painter", "A drawing is running. Moving would replace "
+                                                 "it - press Stop first.")
+            return
+        try:
+            host, port = self.robot_address()
+            pose = ur_remote.parse_pose(self.canvas_pose.get())
+        except ValueError as e:
+            messagebox.showerror("Robot Painter", str(e))
+            return
+        if not self.busy:
+            self.apply_settings()  # current Robot tab values (orientation, pen heights)
+        if not messagebox.askokcancel(
+                "Go to canvas origin",
+                f"The robot at {host}:{port} will move in a straight line to "
+                f"{ORIGIN_CHECK_MM:g} mm above the canvas origin (Feature1 0,0,0), at "
+                f"{ur_remote.GOTO_SPEED * 1000:.0f} mm/s, with the drawing's tool orientation.\n\n"
+                f"Canvas: {ur_remote.pose_text(pose)}\n\n"
+                "Make sure the path is clear and keep a hand near the emergency stop.",
+                icon="warning"):
+            return
+        text = ur_remote.goto_origin_program_text(pose, ORIGIN_CHECK_MM)
+        self.save_online_settings()
+
+        def work():
+            try:
+                ur_remote.send_script(host, port, text)
+                self.online_events.put(("info", f"Moving to {ORIGIN_CHECK_MM:g} mm above the canvas "
+                                                f"origin (sent {datetime.now():%H:%M:%S}). The pencil "
+                                                "tip should stop just above the canvas corner."))
+            except OSError as e:
+                self.online_events.put(("error", f"Could not send to {host}:{port}: {e}"))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def online_read_position(self):
+        """Read the TCP pose from the robot's state stream - nothing is sent to the robot -
+        and show it in base and canvas coordinates (see ur_remote.describe_tcp)."""
+        try:
+            host, port = self.robot_address()
+        except ValueError as e:
+            messagebox.showerror("Robot Painter", str(e))
+            return
+        if not self.busy:
+            self.apply_settings()  # orientation / pen heights used for the comparison
+        feature = self.jog_frame_pose()
+        self.online_status.configure(text=f"Reading position from {host}:{port}…", foreground="#555")
+
+        def work():
+            try:
+                tcp = ur_remote.read_tcp_pose(host, port)
+                text = ur_remote.describe_tcp(tcp, feature, ORIGIN_CHECK_MM)
+                self.online_events.put(("position", (ur_remote.pose_text(tcp), text)))
+            except (OSError, TimeoutError) as e:
+                self.online_events.put(("error", f"Could not read the position from {host}:{port}: {e}"))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def online_use_orientation(self):
+        """Teach the drawing orientation: read the TCP pose (nothing is sent to the robot) and
+        set Orientation RX/RY/RZ (Robot tab) to the tool's rotation relative to the canvas."""
+        try:
+            host, port = self.robot_address()
+            feature = ur_remote.parse_pose(self.canvas_pose.get())
+        except ValueError as e:
+            messagebox.showerror("Robot Painter", str(e))
+            return
+        self.online_status.configure(text=f"Reading tool orientation from {host}:{port}…",
+                                     foreground="#555")
+
+        def work():
+            try:
+                tcp = ur_remote.read_tcp_pose(host, port)
+                self.online_events.put(("orientation", (tcp, ur_remote.orientation_in_canvas(tcp, feature))))
+            except (OSError, TimeoutError) as e:
+                self.online_events.put(("error", f"Could not read the position from {host}:{port}: {e}"))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def apply_taught_orientation(self, tcp, rotvec):
+        """Main thread: confirm, then write the taught orientation into the Robot tab."""
+        keys = ("ORIENT_RX", "ORIENT_RY", "ORIENT_RZ")
+        old = []
+        for k in keys:
+            try:
+                old.append(float(self.vars[k].get()))
+            except (tk.TclError, ValueError):
+                old.append(getattr(core, k))
+        new = [round(v, 4) for v in rotvec]
+        if not messagebox.askyesno(
+                "Use current tool orientation",
+                "Set the drawing orientation (Robot tab) to the tool's current orientation "
+                "relative to the canvas?\n\n"
+                f"RX  {old[0]:8.4f}  →  {new[0]:8.4f}\n"
+                f"RY  {old[1]:8.4f}  →  {new[1]:8.4f}\n"
+                f"RZ  {old[2]:8.4f}  →  {new[2]:8.4f}\n\n"
+                "Drawings, jogs to the origin and the .script files will then hold the pen "
+                "exactly as it is now. The robot does not move."):
+            self.online_status.configure(text="Orientation unchanged", foreground="#555")
+            return
+        for k, v in zip(keys, new):
+            self.vars[k].set(v)   # trace -> preview and scripts are regenerated with it
+        self.save_online_settings()  # kept across restarts, like the canvas pose
+        self.online_status.configure(
+            text=f"Drawing orientation set to ({new[0]:g}, {new[1]:g}, {new[2]:g}) - see Robot "
+                 "tab. Read position should now show a tool angle of about 0°.",
+            foreground="#2e7d32")
+
+    def online_log_pose(self):
+        """Log the TCP pose on the pendant (Log tab + popup) and show it here too.
+        Feature1 can't be logged from outside PolyScope: see urscript/print_feature_pose.script."""
+        if self.online_run:
+            messagebox.showinfo("Robot Painter", "A drawing is running. Sending a program would "
+                                                 "replace it - press Stop first.")
+            return
+        try:
+            host, port = self.robot_address()
+        except ValueError as e:
+            messagebox.showerror("Robot Painter", str(e))
+            return
+        text = ur_remote.pose_log_program_text(self.jog_frame_pose())
+        self.online_status.configure(text=f"Reading pose from {host}:{port}…", foreground="#555")
+
+        def work():
+            try:
+                ur_remote.send_script(host, port, text)      # log + popup on the pendant
+            except OSError as e:
+                self.online_events.put(("error", f"Could not send to {host}:{port}: {e}"))
+                return
+            try:
+                pose = ur_remote.read_tcp_pose(host, port)  # same pose from the state stream
+                self.online_events.put(("pose", ur_remote.pose_text(pose)))
+            except (OSError, TimeoutError) as e:
+                self.online_events.put(("info", f"Pose logged on the pendant (Log tab). "
+                                                f"Could not read it back here: {e}"))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def online_jog(self, direction):
+        if self.online_run:
+            messagebox.showinfo("Robot Painter", "A drawing is running. Jogging would replace "
+                                                 "it - press Stop first.")
+            return
+        try:
+            host, port = self.robot_address()
+        except ValueError as e:
+            messagebox.showerror("Robot Painter", str(e))
+            return
+        step = self.jog_step.get()
+        dx, dy, dz = (v * step for v in direction)
+        pose = self.jog_frame_pose()
+        text = ur_remote.jog_program_text(dx, dy, dz, pose)
+        axis = next(f"{'+' if v > 0 else '-'}{n}" for v, n in zip(direction, "XYZ") if v)
+        frame = "base" if pose is None else "canvas"
+        self.save_online_settings()
+
+        def work():
+            try:
+                ur_remote.send_script(host, port, text)
+                self.online_events.put(("info", f"Jog {axis} {step:g} mm ({frame} frame) sent "
+                                                f"{datetime.now():%H:%M:%S}"))
+            except OSError as e:
+                self.online_events.put(("error", f"Could not send jog to {host}:{port}: {e}"))
+
+        threading.Thread(target=work, daemon=True).start()
 
     def on_online_speed(self, value):
         snapped = int(round(float(value) / 5) * 5)  # 5 % steps
@@ -633,6 +910,9 @@ class App:
             ONLINE_SETTINGS.write_text(json.dumps({
                 "ip": self.robot_ip.get().strip(), "port": self.robot_port.get(),
                 "canvas_pose": self.canvas_pose.get().strip(), "speed": self.online_speed.get(),
+                "jog_step_mm": self.jog_step.get(),
+                # drawing orientation relative to Feature1: belongs to this robot setup
+                "orientation": [self.vars[k].get() for k in ("ORIENT_RX", "ORIENT_RY", "ORIENT_RZ")],
             }, indent=2), encoding="utf-8")
         except (OSError, tk.TclError):
             pass  # only a convenience
@@ -721,6 +1001,24 @@ class App:
                     self.online_progress.configure(value=0)
                     self.online_status.configure(text=f"Stop sent {datetime.now():%H:%M:%S}: "
                                                       "robot stopped, pen lifted", foreground="#555")
+                elif kind == "info":
+                    self.online_status.configure(text=payload, foreground="#2e7d32")
+                elif kind == "orientation":
+                    self.apply_taught_orientation(*payload)
+                elif kind == "position":
+                    pose_str, text = payload
+                    self.root.clipboard_clear()
+                    self.root.clipboard_append(pose_str)
+                    self.position_label.configure(text=f"TCP position at {datetime.now():%H:%M:%S}:\n{text}")
+                    self.position_label.grid()
+                    self.online_status.configure(text="Position read (shown above; base pose "
+                                                      "copied to the clipboard)", foreground="#2e7d32")
+                elif kind == "pose":
+                    self.root.clipboard_clear()
+                    self.root.clipboard_append(payload)
+                    self.online_status.configure(
+                        text=f"TCP pose (base frame), also in the pendant's Log tab and copied "
+                             f"to the clipboard:\n{payload}", foreground="#2e7d32")
                 else:
                     self.online_run = None
                     self.online_status.configure(text=payload, foreground="#c62828")
@@ -745,6 +1043,8 @@ class App:
             text = "AI off"
         elif self.ai.state == "starting":
             text = f"Starting AI worker… {self.ai.last_log_line()}"
+        elif self.ai.state == "ready" and self.ai._lock.locked():   # generating right now
+            text = f"AI working… {self.ai.last_log_line()}"
         elif self.ai.state == "ready":
             text = f"AI ready: {AI_ENGINES[self.ai.engine]['label']} ({self.ai.info})"
         else:
